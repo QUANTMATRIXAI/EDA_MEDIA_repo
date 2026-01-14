@@ -859,7 +859,104 @@ if region_col:
         default=regions[:5] if len(regions) > 5 else regions,
     )
 
-tab_main, tab_knn, tab_weekly = st.tabs(["Meta vs Other", "Region KNN", "Week-by-week"])
+tab_clean, tab_main, tab_knn, tab_weekly = st.tabs(
+    ["Data cleanup", "Meta vs Other", "Region KNN", "Week-by-week"]
+)
+
+with tab_clean:
+    tab_clean.subheader("Data cleanup")
+    tab_clean.caption("Upload GA funnel data, fix the date column, and assign Meta vs Other.")
+    clean_upload = tab_clean.file_uploader(
+        "Upload Excel or CSV for cleanup",
+        type=["xlsx", "xls", "csv"],
+        key="cleanup_upload",
+    )
+    if clean_upload:
+        is_csv_clean = _is_csv_file(clean_upload)
+        sheet_clean = None
+        if not is_csv_clean:
+            clean_upload.seek(0)
+            xls_clean = pd.ExcelFile(clean_upload)
+            clean_upload.seek(0)
+            sheet_clean = tab_clean.selectbox(
+                "Sheet",
+                xls_clean.sheet_names,
+                index=0,
+                key="cleanup_sheet",
+            )
+        skip_rows = tab_clean.number_input(
+            "Skip header/meta rows",
+            min_value=0,
+            max_value=100,
+            value=0,
+            step=1,
+            help="Use this when the file has extra info before the header row.",
+        )
+        clean_upload.seek(0)
+        if is_csv_clean:
+            hdr = pd.read_csv(clean_upload, nrows=0, skiprows=int(skip_rows))
+        else:
+            hdr = pd.read_excel(clean_upload, sheet_name=sheet_clean, nrows=0, engine="openpyxl", skiprows=int(skip_rows))
+        clean_upload.seek(0)
+        cols_clean = list(hdr.columns)
+        date_default = "Date" if "Date" in cols_clean else cols_clean[0]
+        source_default = "Session source" if "Session source" in cols_clean else cols_clean[0]
+
+        c1, c2 = tab_clean.columns([1, 1], gap="large")
+        date_col_clean = c1.selectbox("Date column", cols_clean, index=cols_clean.index(date_default))
+        source_col_clean = c2.selectbox("Source column", cols_clean, index=cols_clean.index(source_default))
+
+        meta_pattern_input = tab_clean.text_input(
+            "META pattern",
+            value=META_PATTERN,
+            help="Regex used to classify Meta vs Other.",
+            key="cleanup_meta_pattern",
+        )
+        run_cleanup = tab_clean.button("Generate cleaned data", use_container_width=True, key="cleanup_run")
+
+        if run_cleanup:
+            clean_upload.seek(0)
+            if is_csv_clean:
+                df_clean = pd.read_csv(clean_upload, skiprows=int(skip_rows))
+            else:
+                df_clean = pd.read_excel(
+                    clean_upload, sheet_name=sheet_clean, engine="openpyxl", skiprows=int(skip_rows)
+                )
+            clean_upload.seek(0)
+            df_clean.columns = [str(c).strip() for c in df_clean.columns]
+
+            raw_date = df_clean[date_col_clean]
+            parsed_date = pd.to_datetime(raw_date, errors="coerce")
+            if parsed_date.isna().all():
+                parsed_date = pd.to_datetime(raw_date.astype(str).str.strip(), format="%Y%m%d", errors="coerce")
+
+            df_clean[date_col_clean] = parsed_date.dt.tz_localize(None).dt.normalize()
+            meta_pattern = meta_pattern_input or META_PATTERN
+            meta_mask = df_clean[source_col_clean].astype(str).str.contains(meta_pattern, case=False, na=False, regex=True)
+            df_clean["Source Type"] = meta_mask.map(lambda v: "Meta" if v else "Other")
+            df_clean["Is Meta"] = meta_mask
+
+            if df_clean[date_col_clean].isna().any():
+                tab_clean.warning("Some rows could not be converted to dates. Review the preview below.")
+
+            tab_clean.subheader("Preview (first 50 rows)")
+            tab_clean.dataframe(df_clean.head(50), use_container_width=True)
+
+            out_name = tab_clean.text_input(
+                "Output file name",
+                value="ga_funnel_cleaned.csv",
+                key="cleanup_out_name",
+            )
+            out_name = out_name.strip() or "ga_funnel_cleaned.csv"
+            csv_bytes = df_clean.to_csv(index=False).encode("utf-8")
+            tab_clean.download_button(
+                label="Download cleaned CSV",
+                data=csv_bytes,
+                file_name=out_name,
+                mime="text/csv",
+            )
+        else:
+            tab_clean.info("Click Generate cleaned data to preview and download the cleaned file.")
 
 with tab_main:
     # Graph state
