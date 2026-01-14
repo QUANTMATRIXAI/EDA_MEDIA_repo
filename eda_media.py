@@ -754,3 +754,448 @@ with st.sidebar:
     with st.spinner("Preparing fast cache (Excel/CSV → Parquet)…"):
         parquet_path = ensure_parquet(uploaded, sheet, date_col)
 
+con = duckdb_connect_view(parquet_path)
+allowed_cols = cols[:]
+
+# Data min/max dates
+dt_sql = safe_ident(date_col, allowed_cols)
+minmax = con.execute(f"SELECT MIN(CAST({dt_sql} AS DATE)) AS min_d, MAX(CAST({dt_sql} AS DATE)) AS max_d FROM t;").df()
+min_d = pd.to_datetime(minmax.loc[0, "min_d"]).date()
+max_d = pd.to_datetime(minmax.loc[0, "max_d"]).date()
+
+# Sidebar global settings
+st.sidebar.subheader("Global settings")
+agg_fn = st.sidebar.selectbox("Aggregation", ["sum", "mean"], index=0)
+
+# Experiment period (sidebar)
+# Experiment period (sidebar)
+st.sidebar.subheader("Experiment period")
+exp_range = st.sidebar.date_input(
+    "Select experiment start/end",
+    value=(min_d, max_d),
+    min_value=min_d,
+    max_value=max_d,
+)
+exp_start = pd.to_datetime(exp_range[0])
+exp_end = pd.to_datetime(exp_range[1])
+
+# Metrics pool (numeric only)
+exclude = {source_col, date_col}
+if region_col:
+    exclude.add(region_col)
+metrics_pool = get_numeric_metrics(con, cols, exclude=exclude)
+if not metrics_pool:
+    st.error("No numeric metric columns found in this sheet.")
+    st.stop()
+
+# Region selection (global)
+regions_selected: list[str] = []
+if region_col:
+    rg_sql = safe_ident(region_col, allowed_cols)
+    regions_df = con.execute(
+        f"""
+        SELECT DISTINCT CAST({rg_sql} AS VARCHAR) AS region
+        FROM t
+        WHERE {rg_sql} IS NOT NULL
+        ORDER BY region
+        """
+    ).df()
+    regions = regions_df["region"].dropna().astype(str).tolist()
+    st.sidebar.subheader("Regions (global filter)")
+    regions_selected = st.sidebar.multiselect(
+        "Select regions (affects charts + correlations)",
+        options=regions,
+        default=regions[:5] if len(regions) > 5 else regions,
+    )
+
+tab_main, tab_knn, tab_weekly = st.tabs(["Meta vs Other", "Region KNN", "Week-by-week"])
+
+with tab_main:
+    # Graph state
+    if "graph_count" not in st.session_state:
+        st.session_state.graph_count = 1
+    if "graph_dates" not in st.session_state:
+        st.session_state.graph_dates = {}
+    if "graph_metrics" not in st.session_state:
+        st.session_state.graph_metrics = {}
+    if "graph_minmax" not in st.session_state:
+        st.session_state.graph_minmax = {}
+    if "graph_corr_target" not in st.session_state:
+        st.session_state.graph_corr_target = {}
+
+    # Render graphs
+    for i in range(st.session_state.graph_count):
+        st.divider()
+        st.subheader(f"📈 Graph {i+1}")
+
+        # controls in ONE ROW (columns): date | y-metrics | minmax+corrTarget
+        c_date, c_metrics, c_opts = st.columns([1.2, 2.8, 1.4], gap="small")
+
+        # per-graph defaults
+        if i not in st.session_state.graph_dates:
+            st.session_state.graph_dates[i] = (min_d, max_d)
+        if i not in st.session_state.graph_metrics:
+            st.session_state.graph_metrics[i] = metrics_pool[:2] if len(metrics_pool) >= 2 else metrics_pool[:1]
+        if i not in st.session_state.graph_minmax:
+            st.session_state.graph_minmax[i] = True
+
+        g_date = c_date.date_input(
+            "Date range",
+            value=st.session_state.graph_dates[i],
+            min_value=min_d,
+            max_value=max_d,
+            key=f"date_{i}",
+        )
+        st.session_state.graph_dates[i] = g_date
+        g_start = pd.to_datetime(g_date[0])
+        g_end = pd.to_datetime(g_date[1])
+
+        metrics_sel = c_metrics.multiselect(
+            "Y-metrics (lines)",
+            options=metrics_pool,
+            default=st.session_state.graph_metrics[i],
+            key=f"metrics_{i}",
+        )
+        st.session_state.graph_metrics[i] = metrics_sel
+
+        do_minmax = c_opts.checkbox(
+            "Min–Max (0–1)",
+            value=st.session_state.graph_minmax[i],
+            key=f"minmax_{i}",
+            help="ON: each line scaled 0–1. OFF: raw values.",
+        )
+        st.session_state.graph_minmax[i] = do_minmax
+
+        corr_target_options = metrics_sel[:] if metrics_sel else metrics_pool
+        default_target = corr_target_options[0] if corr_target_options else None
+        if i not in st.session_state.graph_corr_target:
+            st.session_state.graph_corr_target[i] = default_target
+
+        corr_target = c_opts.selectbox(
+            "Corr target",
+            options=corr_target_options if corr_target_options else ["(none)"],
+            index=0,
+            key=f"corr_target_{i}",
+            help="Correlations shown below each chart: each metric vs this target.",
+        )
+        st.session_state.graph_corr_target[i] = corr_target
+
+        # plots
+        left, right = st.columns(2, gap="large")
+
+        # META side
+        df_meta_wide_plot = fetch_agg_for_plot(
+            con, allowed_cols, source_col, date_col,
+            metrics_sel, region_col, regions_selected,
+            agg_fn, g_start, g_end, want_meta=True
+        )
+        meta_long = make_long(df_meta_wide_plot, metrics_sel, region_col, do_minmax)
+
+        with left:
+            st.markdown("### 🟦 Meta Sources")
+            plot_lines(
+                meta_long,
+                title="Meta",
+                key=f"meta_plot_{i}",
+                y_label="Scaled (0–1)" if do_minmax else "Value",
+            )
+
+            # correlation scorecard for META (day-only)
+            df_meta_corr = fetch_agg_day_only_for_corr(
+                con, allowed_cols, source_col, date_col,
+                metrics_sel, region_col, regions_selected,
+                agg_fn, g_start, g_end, want_meta=True
+            )
+            corr_tbl = corr_scorecard(df_meta_corr, metrics_sel, corr_target, exp_start, exp_end)
+            st.caption(f"Pearson correlation vs **{corr_target}** (Full vs Experiment)")
+            if corr_tbl.empty:
+                st.info("Not enough data / select at least 2 metrics to show correlations.")
+            else:
+                st.dataframe(corr_tbl, use_container_width=True, hide_index=True)
+
+        # OTHER side
+        df_other_wide_plot = fetch_agg_for_plot(
+            con, allowed_cols, source_col, date_col,
+            metrics_sel, region_col, regions_selected,
+            agg_fn, g_start, g_end, want_meta=False
+        )
+        other_long = make_long(df_other_wide_plot, metrics_sel, region_col, do_minmax)
+
+        with right:
+            st.markdown("### 🟩 Other Sources")
+            plot_lines(
+                other_long,
+                title="Other",
+                key=f"other_plot_{i}",
+                y_label="Scaled (0–1)" if do_minmax else "Value",
+            )
+
+            df_other_corr = fetch_agg_day_only_for_corr(
+                con, allowed_cols, source_col, date_col,
+                metrics_sel, region_col, regions_selected,
+                agg_fn, g_start, g_end, want_meta=False
+            )
+            corr_tbl2 = corr_scorecard(df_other_corr, metrics_sel, corr_target, exp_start, exp_end)
+            st.caption(f"Pearson correlation vs **{corr_target}** (Full vs Experiment)")
+            if corr_tbl2.empty:
+                st.info("Not enough data / select at least 2 metrics to show correlations.")
+            else:
+                st.dataframe(corr_tbl2, use_container_width=True, hide_index=True)
+
+        # Add/Remove buttons ALWAYS below the LAST graph
+        if i == st.session_state.graph_count - 1:
+            b1, b2, _ = st.columns([1, 1, 6])
+            if b1.button("+ Add Graph Below", use_container_width=True, key=f"add_{i}"):
+                st.session_state.graph_count += 1
+                st.rerun()
+            if b2.button("− Remove Last", use_container_width=True, key=f"rem_{i}") and st.session_state.graph_count > 1:
+                last = st.session_state.graph_count - 1
+                st.session_state.graph_dates.pop(last, None)
+                st.session_state.graph_metrics.pop(last, None)
+                st.session_state.graph_minmax.pop(last, None)
+                st.session_state.graph_corr_target.pop(last, None)
+                st.session_state.graph_count -= 1
+                st.rerun()
+
+    with st.expander("Preview (first 50 rows)"):
+        preview = con.execute("SELECT * FROM t LIMIT 50;").df()
+        st.dataframe(preview, use_container_width=True)
+
+with tab_weekly:
+    tab_weekly.subheader("Week-by-week experiment view")
+    tab_weekly.caption("Use the controls below to compare each week stitched to your experiment window.")
+    controls_left, controls_right = tab_weekly.columns([1, 1], gap="large")
+    baseline_weeks = controls_left.slider(
+        "Baseline weeks before experiment",
+        0,
+        8,
+        4,
+        help="Include this many full weeks before the experiment to build the baseline index.",
+    )
+    post_weeks = controls_left.slider(
+        "Weeks after experiment",
+        0,
+        4,
+        1,
+        help="Include these weeks after the experiment end if data is available.",
+    )
+    source_mode_label = controls_right.selectbox(
+        "Source focus",
+        ["Meta", "Other", "All"],
+        index=0,
+    )
+    week_metrics_default = metrics_pool[:2] if len(metrics_pool) >= 2 else metrics_pool
+    week_metrics = controls_right.multiselect(
+        "Metrics to summarize weekly",
+        options=metrics_pool,
+        default=st.session_state.get("week_metrics_weekly", week_metrics_default),
+        key="week_metrics_weekly",
+    )
+
+    if not week_metrics:
+        tab_weekly.info("Select at least one metric to generate the weekly summary.")
+    else:
+        analysis_start = exp_start - pd.Timedelta(weeks=baseline_weeks)
+        analysis_end = exp_end + pd.Timedelta(weeks=post_weeks)
+        exp_weeks = max(((exp_end - exp_start).days // 7) + 1, 1)
+        regions_label = ", ".join(regions_selected) if regions_selected else "All regions"
+        context_lines = [
+            f"Source focus {source_mode_label}. Aggregating {baseline_weeks} baseline, {exp_weeks} experiment, and {post_weeks} post week(s) covering {analysis_start.date()} to {analysis_end.date()}.",
+            "Weekly table uses weekly sums; baseline/post are averages of those weekly sums.",
+            f"Regions filter: {regions_label}.",
+        ]
+        context_block = "<br>".join(context_lines)
+        mode_map = {"Meta": "meta", "Other": "other", "All": "all"}
+        source_mode = mode_map.get(source_mode_label, "meta")
+        week_df = fetch_weekly_aggregates(
+            con, allowed_cols, source_col, date_col,
+            week_metrics, region_col, regions_selected,
+            "sum", analysis_start, analysis_end, source_mode, exp_start
+        )
+        ratio_metrics = add_weekly_ratio_metrics(week_df)
+        week_long = build_weekly_summary(week_df, week_metrics, region_col, exp_start, exp_end)
+        if week_long.empty:
+            tab_weekly.warning("No weekly data is available for the selected filters.")
+        else:
+            scope_options = sorted(week_long["Scope"].unique())
+            if not scope_options:
+                tab_weekly.warning("No region/week scopes were generated.")
+            else:
+                focus_key = "weekly_focus_region"
+                if focus_key not in st.session_state or st.session_state[focus_key] not in scope_options:
+                    st.session_state[focus_key] = scope_options[0]
+                focus_region = controls_right.selectbox(
+                    "Focus region for indexing",
+                    options=scope_options,
+                    key=focus_key,
+                    index=scope_options.index(st.session_state[focus_key]),
+                )
+                available_references = [s for s in scope_options if s != focus_region]
+                ref_key = "weekly_reference_regions"
+                if ref_key not in st.session_state:
+                    st.session_state[ref_key] = []
+                default_refs = [r for r in st.session_state[ref_key] if r in available_references]
+                if not default_refs:
+                    default_refs = available_references[:2]
+                reference_regions = controls_right.multiselect(
+                    "Reference regions",
+                    options=available_references,
+                    default=default_refs,
+                    key=ref_key,
+                )
+                include_all_key = "weekly_include_all_scopes"
+                include_all_scopes = controls_left.checkbox(
+                    "Include all filtered regions",
+                    value=st.session_state.get(include_all_key, False),
+                    key=include_all_key,
+                )
+                with controls_left.expander("Weekly table context", expanded=True):
+                    st.markdown(context_block, unsafe_allow_html=True)
+                table = build_weekly_period_table(week_long, focus_region, reference_regions)
+                if table.empty:
+                    tab_weekly.warning("Unable to summarize the weekly periods for the chosen filters.")
+                else:
+                    focus_line = f"Focus={focus_region}; reference set={', '.join(reference_regions) or 'none'}."
+                    with controls_right.expander("Selected focus & references", expanded=True):
+                        st.markdown(focus_line)
+                    reference_display = ["Reference avg"] if reference_regions else []
+                    if not include_all_scopes:
+                        allowed = {focus_region, *reference_display, "All"}
+                        table = table[table["Scope"].isin(allowed)]
+                    metric_names = [m for m in week_metrics if m in table["Metric"].unique()]
+                    metric_tabs = tab_weekly.tabs(metric_names)
+                    for metric, metric_tab in zip(metric_names, metric_tabs):
+                        metric_table = table[table["Metric"] == metric].drop(columns=["Metric"])
+                        with metric_tab:
+                            styled = style_weekly_table(metric_table, focus_region, reference_display)
+                            st.dataframe(styled, use_container_width=True)
+
+                    if ratio_metrics:
+                        ratio_long = build_weekly_summary(
+                            week_df, ratio_metrics, region_col, exp_start, exp_end
+                        )
+                        ratio_table = build_weekly_period_table(
+                            ratio_long, focus_region, reference_regions
+                        )
+                        if not ratio_table.empty:
+                            tab_weekly.divider()
+                            tab_weekly.subheader("Computed ratios (post-week aggregation)")
+                            if not include_all_scopes:
+                                allowed = {focus_region, *reference_display, "All"}
+                                ratio_table = ratio_table[ratio_table["Scope"].isin(allowed)]
+                            ratio_names = [m for m in ratio_metrics if m in ratio_table["Metric"].unique()]
+                            ratio_tabs = tab_weekly.tabs(ratio_names)
+                            for metric, ratio_tab in zip(ratio_names, ratio_tabs):
+                                metric_table = ratio_table[ratio_table["Metric"] == metric].drop(columns=["Metric"])
+                                with ratio_tab:
+                                    styled = style_weekly_table(
+                                        metric_table, focus_region, reference_display
+                                    )
+                                    st.dataframe(styled, use_container_width=True)
+
+with tab_knn:
+    tab_knn.subheader("Region similarity (KNN)")
+    tab_knn.caption("Select metrics and a focus region to find the closest regions.")
+    if not region_col:
+        tab_knn.info("Select a Region column in the sidebar to enable region clustering.")
+    else:
+        knn_left, knn_right = tab_knn.columns([1, 1], gap="large")
+        knn_date = knn_left.date_input(
+            "Date range",
+            value=(min_d, max_d),
+            min_value=min_d,
+            max_value=max_d,
+            key="knn_date_range",
+        )
+        knn_metrics_default = metrics_pool[:5] if len(metrics_pool) >= 5 else metrics_pool
+        knn_metrics = knn_left.multiselect(
+            "Metrics for similarity",
+            options=metrics_pool,
+            default=st.session_state.get("knn_metrics", knn_metrics_default),
+            key="knn_metrics",
+        )
+
+        focus_region = knn_right.selectbox(
+            "Focus region",
+            options=regions,
+            index=0,
+            key="knn_focus_region",
+        )
+        candidate_regions = knn_right.multiselect(
+            "Candidate regions",
+            options=regions,
+            default=regions,
+            key="knn_candidate_regions",
+        )
+        max_k = max(len(candidate_regions) - 1, 1)
+        k_neighbors = knn_right.slider(
+            "K neighbors",
+            min_value=1,
+            max_value=max_k,
+            value=min(5, max_k),
+            key="knn_k",
+        )
+        run_knn = knn_right.button("Run KNN", use_container_width=True, key="knn_run")
+
+        if not knn_metrics:
+            tab_knn.info("Select at least one metric to run KNN.")
+        elif not run_knn:
+            tab_knn.info("Click Run KNN to compute the closest regions.")
+        else:
+            knn_start = pd.to_datetime(knn_date[0])
+            knn_end = pd.to_datetime(knn_date[1])
+            source_mode = "all"
+
+            features = fetch_region_features(
+                con,
+                allowed_cols,
+                source_col,
+                date_col,
+                knn_metrics,
+                region_col,
+                agg_fn,
+                knn_start,
+                knn_end,
+                source_mode,
+                candidate_regions,
+            )
+
+            if features.empty or focus_region not in features["region"].astype(str).tolist():
+                tab_knn.warning("No data for the selected focus region and filters.")
+            else:
+                features = features.copy()
+                features["region"] = features["region"].astype(str)
+                metrics_df = features[["region"] + knn_metrics].copy()
+                for m in knn_metrics:
+                    metrics_df[m] = pd.to_numeric(metrics_df[m], errors="coerce")
+                metrics_df = metrics_df.dropna(subset=knn_metrics, how="all")
+
+                if metrics_df.empty:
+                    tab_knn.warning("No numeric data after applying the filters.")
+                else:
+                    values = metrics_df.set_index("region")
+                    means = values.mean()
+                    stds = values.std().replace(0, pd.NA)
+                    scaled = (values - means) / stds
+                    scaled = scaled.fillna(0)
+
+                    focus_vec = scaled.loc[focus_region]
+                    distances = (scaled - focus_vec).pow(2).sum(axis=1).pow(0.5)
+                    distances = distances.drop(index=focus_region, errors="ignore")
+
+                    results = distances.sort_values().head(k_neighbors).reset_index()
+                    results.columns = ["Region", "Distance"]
+                    tab_knn.subheader("Closest regions")
+                    tab_knn.dataframe(results, use_container_width=True, hide_index=True)
+                    fig = px.bar(
+                        results,
+                        x="Region",
+                        y="Distance",
+                        title="Closest regions (lower is closer)",
+                        text="Distance",
+                    )
+                    fig.update_traces(textposition="outside")
+                    fig.update_layout(margin=dict(l=10, r=10, t=45, b=10))
+                    tab_knn.plotly_chart(fig, use_container_width=True)
+                    with tab_knn.expander("Raw feature values"):
+                        tab_knn.dataframe(metrics_df, use_container_width=True, hide_index=True)
