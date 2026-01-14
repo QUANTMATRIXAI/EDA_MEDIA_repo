@@ -318,6 +318,54 @@ def fetch_weekly_aggregates(
     return con.execute(sql, params).df()
 
 
+def fetch_metric_totals(
+    con: duckdb.DuckDBPyConnection,
+    allowed_cols: list[str],
+    source_col: str,
+    date_col: str,
+    metrics: list[str],
+    region_col: str | None,
+    regions_selected: list[str],
+    start_d: pd.Timestamp,
+    end_d: pd.Timestamp,
+    want_meta: bool,
+) -> pd.Series:
+    if not metrics:
+        return pd.Series(dtype="float")
+
+    src = safe_ident(source_col, allowed_cols)
+    dt = safe_ident(date_col, allowed_cols)
+    rg = safe_ident(region_col, allowed_cols) if region_col else None
+
+    metric_exprs = []
+    for m in metrics:
+        m_id = safe_ident(m, allowed_cols)
+        metric_exprs.append(f'COALESCE(SUM(TRY_CAST({m_id} AS DOUBLE)), 0) AS {quoted_alias(m)}')
+
+    where_clauses = [f"CAST({dt} AS DATE) BETWEEN ? AND ?"]
+    params: list = [start_d.date(), end_d.date()]
+
+    mw, mw_params = _meta_where(src, want_meta)
+    where_clauses.append(mw)
+    params.extend(mw_params)
+
+    if region_col and regions_selected:
+        placeholders = ",".join(["?"] * len(regions_selected))
+        where_clauses.append(f"CAST({rg} AS VARCHAR) IN ({placeholders})")
+        params.extend(regions_selected)
+
+    sql = f"""
+        SELECT
+          {", ".join(metric_exprs)}
+        FROM t
+        WHERE {" AND ".join(where_clauses)}
+    """
+    row = con.execute(sql, params).df()
+    if row.empty:
+        return pd.Series(dtype="float")
+    return row.iloc[0]
+
+
 def fetch_region_features(
     con: duckdb.DuckDBPyConnection,
     allowed_cols: list[str],
@@ -693,6 +741,33 @@ def make_long(df_wide: pd.DataFrame, metrics: list[str], region_col: str | None,
     return minmax_scale_per_series(long_df, "series", "value") if do_minmax else long_df
 
 
+def parse_date_series(series: pd.Series) -> pd.Series:
+    raw = series.copy()
+    numeric = pd.to_numeric(raw, errors="coerce")
+    numeric_non_na = numeric.dropna()
+    if not numeric_non_na.empty:
+        as_int = numeric_non_na.astype("Int64")
+        as_str = as_int.astype(str)
+        if (as_str.str.len() == 8).mean() >= 0.8:
+            parsed = pd.to_datetime(numeric.astype("Int64").astype(str), format="%Y%m%d", errors="coerce")
+            if parsed.notna().sum() > 0:
+                return parsed
+        if (as_str.str.len() == 14).mean() >= 0.8:
+            parsed = pd.to_datetime(numeric.astype("Int64").astype(str), format="%Y%m%d%H%M%S", errors="coerce")
+            if parsed.notna().sum() > 0:
+                return parsed
+        median_val = numeric_non_na.median()
+        if median_val > 1e11:
+            parsed = pd.to_datetime(numeric, unit="ms", errors="coerce")
+            if parsed.notna().sum() > 0:
+                return parsed
+        if median_val > 1e9:
+            parsed = pd.to_datetime(numeric, unit="s", errors="coerce")
+            if parsed.notna().sum() > 0:
+                return parsed
+    return pd.to_datetime(raw.astype(str).str.strip(), errors="coerce")
+
+
 def plot_lines(long_df: pd.DataFrame, title: str, key: str, y_label: str):
     if long_df is None or long_df.empty:
         st.warning("No data after filters.")
@@ -859,8 +934,8 @@ if region_col:
         default=regions[:5] if len(regions) > 5 else regions,
     )
 
-tab_clean, tab_main, tab_knn, tab_weekly = st.tabs(
-    ["Data cleanup", "Meta vs Other", "Region KNN", "Week-by-week"]
+tab_clean, tab_main, tab_compare, tab_knn, tab_weekly = st.tabs(
+    ["Data cleanup", "Meta vs Other", "Comparison", "Region KNN", "Week-by-week"]
 )
 
 with tab_clean:
@@ -925,11 +1000,7 @@ with tab_clean:
             clean_upload.seek(0)
             df_clean.columns = [str(c).strip() for c in df_clean.columns]
 
-            raw_date = df_clean[date_col_clean]
-            parsed_date = pd.to_datetime(raw_date, errors="coerce")
-            if parsed_date.isna().all():
-                parsed_date = pd.to_datetime(raw_date.astype(str).str.strip(), format="%Y%m%d", errors="coerce")
-
+            parsed_date = parse_date_series(df_clean[date_col_clean])
             df_clean[date_col_clean] = parsed_date.dt.tz_localize(None).dt.normalize()
             meta_pattern = meta_pattern_input or META_PATTERN
             meta_mask = df_clean[source_col_clean].astype(str).str.contains(meta_pattern, case=False, na=False, regex=True)
@@ -1108,6 +1179,147 @@ with tab_main:
     with st.expander("Preview (first 50 rows)"):
         preview = con.execute("SELECT * FROM t LIMIT 50;").df()
         st.dataframe(preview, use_container_width=True)
+
+with tab_compare:
+    tab_compare.subheader("Meta vs Other comparison (daily totals)")
+    tab_compare.caption("Build ratio tables from daily totals over a selected date range.")
+
+    ratio_specs = [
+        ("Engaged sessions / Sessions", "Engaged sessions", "Sessions"),
+        ("Items viewed / Sessions", "Items viewed", "Sessions"),
+        ("Add to carts / Sessions", "Add to carts", "Sessions"),
+        ("Items added to cart / Sessions", "Items added to cart", "Sessions"),
+        ("Items added to cart / Add to carts", "Items added to cart", "Add to carts"),
+        ("First time purchasers / Purchases", "First time purchasers", "Purchases"),
+        ("Purchases / Add to carts", "Purchases", "Add to carts"),
+        ("First time purchasers / Add to carts", "First time purchasers", "Add to carts"),
+    ]
+    ratio_names = [r[0] for r in ratio_specs]
+    ratio_map = {r[0]: (r[1], r[2]) for r in ratio_specs}
+
+    if "compare_count" not in st.session_state:
+        st.session_state.compare_count = 1
+    if "compare_dates" not in st.session_state:
+        st.session_state.compare_dates = {}
+    if "compare_ratios" not in st.session_state:
+        st.session_state.compare_ratios = {}
+    if "compare_regions" not in st.session_state:
+        st.session_state.compare_regions = {}
+
+    for i in range(st.session_state.compare_count):
+        tab_compare.divider()
+        tab_compare.subheader(f"Comparison {i+1}")
+
+        c_left, c_right = tab_compare.columns([1.2, 1.8], gap="large")
+        if i not in st.session_state.compare_dates:
+            st.session_state.compare_dates[i] = (min_d, max_d)
+        if i not in st.session_state.compare_ratios:
+            st.session_state.compare_ratios[i] = ratio_names
+
+        cmp_dates = c_left.date_input(
+            "Date range",
+            value=st.session_state.compare_dates[i],
+            min_value=min_d,
+            max_value=max_d,
+            key=f"cmp_dates_{i}",
+        )
+        st.session_state.compare_dates[i] = cmp_dates
+        cmp_start = pd.to_datetime(cmp_dates[0])
+        cmp_end = pd.to_datetime(cmp_dates[1])
+
+        if region_col:
+            if i not in st.session_state.compare_regions:
+                st.session_state.compare_regions[i] = regions
+            cmp_regions = c_left.multiselect(
+                "Regions",
+                options=regions,
+                default=st.session_state.compare_regions[i],
+                key=f"cmp_regions_{i}",
+            )
+            st.session_state.compare_regions[i] = cmp_regions
+        else:
+            cmp_regions = []
+            c_left.caption("No region column selected; using all regions.")
+
+        cmp_ratios = c_right.multiselect(
+            "Ratios to include",
+            options=ratio_names,
+            default=st.session_state.compare_ratios[i],
+            key=f"cmp_ratios_{i}",
+        )
+        st.session_state.compare_ratios[i] = cmp_ratios
+
+        if not cmp_ratios:
+            tab_compare.info("Select at least one ratio to build the comparison table.")
+        else:
+            needed_cols = sorted({col for name in cmp_ratios for col in ratio_map[name]})
+            meta_totals = fetch_metric_totals(
+                con,
+                allowed_cols,
+                source_col,
+                date_col,
+                needed_cols,
+                region_col,
+                cmp_regions,
+                cmp_start,
+                cmp_end,
+                want_meta=True,
+            )
+            other_totals = fetch_metric_totals(
+                con,
+                allowed_cols,
+                source_col,
+                date_col,
+                needed_cols,
+                region_col,
+                cmp_regions,
+                cmp_start,
+                cmp_end,
+                want_meta=False,
+            )
+
+            rows = []
+            for ratio_name in cmp_ratios:
+                num_col, den_col = ratio_map[ratio_name]
+                meta_den = meta_totals.get(den_col, pd.NA)
+                other_den = other_totals.get(den_col, pd.NA)
+                meta_val = (
+                    (meta_totals.get(num_col, pd.NA) / meta_den)
+                    if pd.notna(meta_den) and meta_den != 0
+                    else pd.NA
+                )
+                other_val = (
+                    (other_totals.get(num_col, pd.NA) / other_den)
+                    if pd.notna(other_den) and other_den != 0
+                    else pd.NA
+                )
+                rows.append({"Ratio": ratio_name, "Meta": meta_val, "Other": other_val})
+
+            table = pd.DataFrame(rows)
+            styled = (
+                table.style.format({"Meta": "{:.2f}", "Other": "{:.2f}"})
+                .set_properties(**{"text-align": "center", "font-size": "16px", "font-weight": "600"})
+                .set_table_styles(
+                    [
+                        {"selector": "thead th", "props": [("text-align", "center"), ("font-size", "16px"), ("font-weight", "700")]},
+                        {"selector": "td", "props": [("padding", "8px 10px")]},
+                    ]
+                )
+            )
+            tab_compare.dataframe(styled, use_container_width=True)
+
+        if i == st.session_state.compare_count - 1:
+            b1, b2, _ = tab_compare.columns([1, 1, 6])
+            if b1.button("+ Add Comparison Below", use_container_width=True, key=f"cmp_add_{i}"):
+                st.session_state.compare_count += 1
+                st.rerun()
+            if b2.button("Remove Last", use_container_width=True, key=f"cmp_rem_{i}") and st.session_state.compare_count > 1:
+                last = st.session_state.compare_count - 1
+                st.session_state.compare_dates.pop(last, None)
+                st.session_state.compare_ratios.pop(last, None)
+                st.session_state.compare_regions.pop(last, None)
+                st.session_state.compare_count -= 1
+                st.rerun()
 
 with tab_weekly:
     tab_weekly.subheader("Week-by-week experiment view")
