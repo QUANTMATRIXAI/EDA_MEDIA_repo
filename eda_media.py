@@ -703,14 +703,16 @@ def style_weekly_table(
 
 def add_weekly_ratio_metrics(week_df: pd.DataFrame) -> list[str]:
     ratio_specs = [
-        ("Engaged sessions / Sessions", "Engaged sessions", "Sessions"),
-        ("Items viewed / Sessions", "Items viewed", "Sessions"),
-        ("Add to carts / Sessions", "Add to carts", "Sessions"),
-        ("Items added to cart / Sessions", "Items added to cart", "Sessions"),
-        ("Items added to cart / Add to carts", "Items added to cart", "Add to carts"),
-        ("First time purchasers / Purchases", "First time purchasers", "Purchases"),
-        ("Purchases / Add to carts", "Purchases", "Add to carts"),
-        ("First time purchasers / Add to carts", "First time purchasers", "Add to carts"),
+        ("Engaged Sessions / Sessions", "Engaged Sessions", "Sessions"),
+        ("New Users / Total Users", "New Users", "Total Users"),
+        ("Active Users / Total Users", "Active Users", "Total Users"),
+        ("Active Users / New Users", "Active Users", "New Users"),
+        ("Items Viewed / Sessions", "Items Viewed", "Sessions"),
+        ("Items Viewed / Total Users", "Items Viewed", "Total Users"),
+        ("Add to Carts / Sessions", "Add to Carts", "Sessions"),
+        ("Total Purchasers / Total Users", "Total Purchasers", "Total Users"),
+        ("Total Purchasers / New Users", "Total Purchasers", "New Users"),
+        ("First Time Purchasers / Total Purchasers", "First Time Purchasers", "Total Purchasers"),
     ]
     added: list[str] = []
     for label, numerator, denominator in ratio_specs:
@@ -1185,17 +1187,31 @@ with tab_compare:
     tab_compare.caption("Build ratio tables from daily totals over a selected date range.")
 
     ratio_specs = [
-        ("Engaged sessions / Sessions", "Engaged sessions", "Sessions"),
-        ("Items viewed / Sessions", "Items viewed", "Sessions"),
-        ("Add to carts / Sessions", "Add to carts", "Sessions"),
-        ("Items added to cart / Sessions", "Items added to cart", "Sessions"),
-        ("Items added to cart / Add to carts", "Items added to cart", "Add to carts"),
-        ("First time purchasers / Purchases", "First time purchasers", "Purchases"),
-        ("Purchases / Add to carts", "Purchases", "Add to carts"),
-        ("First time purchasers / Add to carts", "First time purchasers", "Add to carts"),
+        ("Engaged Sessions / Sessions", "Engaged Sessions", "Sessions"),
+        ("New Users / Total Users", "New Users", "Total Users"),
+        ("Active Users / Total Users", "Active Users", "Total Users"),
+        ("Active Users / New Users", "Active Users", "New Users"),
+        ("Items Viewed / Sessions", "Items Viewed", "Sessions"),
+        ("Items Viewed / Total Users", "Items Viewed", "Total Users"),
+        ("Add to Carts / Sessions", "Add to Carts", "Sessions"),
+        ("Total Purchasers / Total Users", "Total Purchasers", "Total Users"),
+        ("Total Purchasers / New Users", "Total Purchasers", "New Users"),
+        ("First Time Purchasers / Total Purchasers", "First Time Purchasers", "Total Purchasers"),
     ]
+    col_lookup = {c.lower(): c for c in allowed_cols}
+    filtered_specs = []
+    for label, numerator, denominator in ratio_specs:
+        num_key = numerator.lower()
+        den_key = denominator.lower()
+        if num_key in col_lookup and den_key in col_lookup:
+            filtered_specs.append((label, col_lookup[num_key], col_lookup[den_key]))
+    ratio_specs = filtered_specs
     ratio_names = [r[0] for r in ratio_specs]
     ratio_map = {r[0]: (r[1], r[2]) for r in ratio_specs}
+
+    if not ratio_specs:
+        tab_compare.warning("No ratio inputs available in this file. Check column names.")
+        st.stop()
 
     if "compare_count" not in st.session_state:
         st.session_state.compare_count = 1
@@ -1213,8 +1229,6 @@ with tab_compare:
         c_left, c_right = tab_compare.columns([1.2, 1.8], gap="large")
         if i not in st.session_state.compare_dates:
             st.session_state.compare_dates[i] = (min_d, max_d)
-        if i not in st.session_state.compare_ratios:
-            st.session_state.compare_ratios[i] = ratio_names
 
         cmp_dates = c_left.date_input(
             "Date range",
@@ -1228,12 +1242,14 @@ with tab_compare:
         cmp_end = pd.to_datetime(cmp_dates[1])
 
         if region_col:
-            if i not in st.session_state.compare_regions:
-                st.session_state.compare_regions[i] = regions
+            default_regions = st.session_state.compare_regions.get(i, regions[:])
+            default_regions = [r for r in default_regions if r in regions]
+            if not default_regions:
+                default_regions = regions[:]
             cmp_regions = c_left.multiselect(
                 "Regions",
                 options=regions,
-                default=st.session_state.compare_regions[i],
+                default=default_regions,
                 key=f"cmp_regions_{i}",
             )
             st.session_state.compare_regions[i] = cmp_regions
@@ -1241,10 +1257,14 @@ with tab_compare:
             cmp_regions = []
             c_left.caption("No region column selected; using all regions.")
 
+        default_ratios = st.session_state.compare_ratios.get(i, ratio_names[:])
+        default_ratios = [r for r in default_ratios if r in ratio_names]
+        if not default_ratios:
+            default_ratios = ratio_names[:]
         cmp_ratios = c_right.multiselect(
             "Ratios to include",
             options=ratio_names,
-            default=st.session_state.compare_ratios[i],
+            default=default_ratios,
             key=f"cmp_ratios_{i}",
         )
         st.session_state.compare_ratios[i] = cmp_ratios
