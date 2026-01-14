@@ -368,6 +368,57 @@ def fetch_region_features(
     return con.execute(sql, params).df()
 
 
+def fetch_region_daily_features(
+    con: duckdb.DuckDBPyConnection,
+    allowed_cols: list[str],
+    source_col: str,
+    date_col: str,
+    metrics: list[str],
+    region_col: str,
+    agg_fn: str,
+    start_d: pd.Timestamp,
+    end_d: pd.Timestamp,
+    source_mode: str,
+    regions_selected: list[str],
+) -> pd.DataFrame:
+    if not metrics:
+        return pd.DataFrame()
+
+    src = safe_ident(source_col, allowed_cols)
+    dt = safe_ident(date_col, allowed_cols)
+    rg = safe_ident(region_col, allowed_cols)
+    agg_sql = "SUM" if agg_fn == "sum" else "AVG"
+
+    metric_exprs = []
+    for m in metrics:
+        m_id = safe_ident(m, allowed_cols)
+        metric_exprs.append(f'COALESCE({agg_sql}(TRY_CAST({m_id} AS DOUBLE)), 0) AS {quoted_alias(m)}')
+
+    where_clauses = [f"CAST({dt} AS DATE) BETWEEN ? AND ?"]
+    params: list = [start_d.date(), end_d.date()]
+
+    meta_clause, meta_params = _meta_mode_where(src, source_mode)
+    where_clauses.append(meta_clause)
+    params.extend(meta_params)
+
+    if regions_selected:
+        placeholders = ",".join(["?"] * len(regions_selected))
+        where_clauses.append(f"CAST({rg} AS VARCHAR) IN ({placeholders})")
+        params.extend(regions_selected)
+
+    sql = f"""
+        SELECT
+          CAST({dt} AS DATE) AS day,
+          CAST({rg} AS VARCHAR) AS region,
+          {", ".join(metric_exprs)}
+        FROM t
+        WHERE {" AND ".join(where_clauses)}
+        GROUP BY day, region
+        ORDER BY day, region
+    """
+    return con.execute(sql, params).df()
+
+
 def build_weekly_summary(
     df_week: pd.DataFrame,
     metrics: list[str],
@@ -1114,6 +1165,13 @@ with tab_knn:
             default=st.session_state.get("knn_metrics", knn_metrics_default),
             key="knn_metrics",
         )
+        knn_mode = knn_left.selectbox(
+            "Feature level",
+            ["Aggregated", "Daily"],
+            index=0,
+            key="knn_feature_level",
+            help="Aggregated uses one vector per region. Daily uses day-level vectors.",
+        )
 
         focus_region = knn_right.selectbox(
             "Focus region",
@@ -1146,29 +1204,69 @@ with tab_knn:
             knn_end = pd.to_datetime(knn_date[1])
             source_mode = "all"
 
-            features = fetch_region_features(
-                con,
-                allowed_cols,
-                source_col,
-                date_col,
-                knn_metrics,
-                region_col,
-                agg_fn,
-                knn_start,
-                knn_end,
-                source_mode,
-                candidate_regions,
-            )
-
-            if features.empty or focus_region not in features["region"].astype(str).tolist():
-                tab_knn.warning("No data for the selected focus region and filters.")
+            if knn_mode == "Daily":
+                daily = fetch_region_daily_features(
+                    con,
+                    allowed_cols,
+                    source_col,
+                    date_col,
+                    knn_metrics,
+                    region_col,
+                    agg_fn,
+                    knn_start,
+                    knn_end,
+                    source_mode,
+                    candidate_regions,
+                )
+                if daily.empty:
+                    tab_knn.warning("No daily data available for the selected filters.")
+                    st.stop()
+                daily["day"] = pd.to_datetime(daily["day"])
+                daily["region"] = daily["region"].astype(str)
+                all_days = pd.date_range(knn_start, knn_end, freq="D")
+                vectors = []
+                for region in candidate_regions:
+                    region_df = daily[daily["region"] == region].set_index("day")
+                    if region_df.empty:
+                        continue
+                    region_df = region_df.reindex(all_days)
+                    region_df[knn_metrics] = region_df[knn_metrics].fillna(0)
+                    row = {"region": region}
+                    for m in knn_metrics:
+                        for day in all_days:
+                            row[f"{m}|{day.date()}"] = float(region_df.loc[day, m])
+                    vectors.append(row)
+                metrics_df = pd.DataFrame(vectors)
             else:
+                features = fetch_region_features(
+                    con,
+                    allowed_cols,
+                    source_col,
+                    date_col,
+                    knn_metrics,
+                    region_col,
+                    agg_fn,
+                    knn_start,
+                    knn_end,
+                    source_mode,
+                    candidate_regions,
+                )
+                if features.empty:
+                    tab_knn.warning("No data for the selected filters.")
+                    st.stop()
                 features = features.copy()
                 features["region"] = features["region"].astype(str)
                 metrics_df = features[["region"] + knn_metrics].copy()
-                for m in knn_metrics:
+
+            if metrics_df.empty or focus_region not in metrics_df["region"].astype(str).tolist():
+                tab_knn.warning("No data for the selected focus region and filters.")
+            else:
+                metrics_df = metrics_df.copy()
+                for m in metrics_df.columns:
+                    if m == "region":
+                        continue
                     metrics_df[m] = pd.to_numeric(metrics_df[m], errors="coerce")
-                metrics_df = metrics_df.dropna(subset=knn_metrics, how="all")
+                metrics_df = metrics_df.dropna(how="all", subset=[c for c in metrics_df.columns if c != "region"])
 
                 if metrics_df.empty:
                     tab_knn.warning("No numeric data after applying the filters.")
