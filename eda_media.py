@@ -330,6 +330,7 @@ def fetch_metric_totals(
     end_d: pd.Timestamp,
     want_meta: bool | None,
     source_regex: str | None = None,
+    exclude_regex: list[str] | None = None,
 ) -> pd.Series:
     if not metrics:
         return pd.Series(dtype="float")
@@ -353,6 +354,10 @@ def fetch_metric_totals(
         mw, mw_params = _meta_where(src, bool(want_meta))
         where_clauses.append(mw)
         params.extend(mw_params)
+    if exclude_regex:
+        for pattern in exclude_regex:
+            where_clauses.append(f"NOT regexp_matches(lower({src}), ?)")
+            params.append(pattern)
 
     if region_col and regions_selected:
         placeholders = ",".join(["?"] * len(regions_selected))
@@ -1303,6 +1308,19 @@ with tab_compare:
                 want_meta=None,
                 source_regex="goog",
             )
+            non_meta_non_google_totals = fetch_metric_totals(
+                con,
+                allowed_cols,
+                source_col,
+                date_col,
+                needed_cols,
+                region_col,
+                cmp_regions,
+                cmp_start,
+                cmp_end,
+                want_meta=False,
+                exclude_regex=["goog"],
+            )
             other_totals = fetch_metric_totals(
                 con,
                 allowed_cols,
@@ -1321,6 +1339,7 @@ with tab_compare:
                 num_col, den_col = ratio_map[ratio_name]
                 meta_den = meta_totals.get(den_col, pd.NA)
                 google_den = google_totals.get(den_col, pd.NA)
+                non_meta_non_google_den = non_meta_non_google_totals.get(den_col, pd.NA)
                 other_den = other_totals.get(den_col, pd.NA)
                 meta_val = (
                     (meta_totals.get(num_col, pd.NA) / meta_den)
@@ -1332,18 +1351,36 @@ with tab_compare:
                     if pd.notna(google_den) and google_den != 0
                     else pd.NA
                 )
+                non_meta_non_google_val = (
+                    (non_meta_non_google_totals.get(num_col, pd.NA) / non_meta_non_google_den)
+                    if pd.notna(non_meta_non_google_den) and non_meta_non_google_den != 0
+                    else pd.NA
+                )
                 other_val = (
                     (other_totals.get(num_col, pd.NA) / other_den)
                     if pd.notna(other_den) and other_den != 0
                     else pd.NA
                 )
                 rows.append(
-                    {"Ratio": ratio_name, "Meta": meta_val, "Google": google_val, "Other": other_val}
+                    {
+                        "Ratio": ratio_name,
+                        "Meta": meta_val,
+                        "Google": google_val,
+                        "Non-Meta Non-Google": non_meta_non_google_val,
+                        "Other": other_val,
+                    }
                 )
 
             table = pd.DataFrame(rows)
             styled = (
-                table.style.format({"Meta": "{:.2f}", "Google": "{:.2f}", "Other": "{:.2f}"})
+                table.style.format(
+                    {
+                        "Meta": "{:.2f}",
+                        "Google": "{:.2f}",
+                        "Non-Meta Non-Google": "{:.2f}",
+                        "Other": "{:.2f}",
+                    }
+                )
                 .set_properties(**{"text-align": "center", "font-size": "16px", "font-weight": "600"})
                 .set_table_styles(
                     [
