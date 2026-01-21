@@ -74,6 +74,8 @@ def normalize_date(series):
 
 
 def ratio_value(df, numerator, denominator):
+    if numerator not in df.columns or denominator not in df.columns:
+        return np.nan
     num = df[numerator].sum()
     den = df[denominator].sum()
     if den == 0:
@@ -101,10 +103,55 @@ def compute_sum_table(df, metrics, periods, masks):
         for label, mask in masks.items():
             for period_label, (start, end) in periods.items():
                 period_df = df[(df['date'] >= start) & (df['date'] <= end) & mask]
-                row[f'{label} {period_label}'] = period_df[metric_col].sum()
+                if period_df.empty:
+                    value = np.nan
+                else:
+                    daily_totals = period_df.groupby('date')[metric_col].sum()
+                    value = daily_totals.mean()
+                row[f'{label} {period_label}'] = value
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+def filter_ratio_defs(ratio_defs, columns):
+    filtered = {}
+    missing = []
+    for name, (num, den) in ratio_defs.items():
+        if num in columns and den in columns:
+            filtered[name] = (num, den)
+        else:
+            missing.append(name)
+    return filtered, missing
+
+
+def build_segment_preview(df, segments):
+    rows = []
+    for name, mask in segments.items():
+        seg = df.loc[mask]
+        rows.append({
+            'Segment': name,
+            'Rows': len(seg),
+            'Unique dates': seg['date'].nunique(),
+            'Date min': seg['date'].min(),
+            'Date max': seg['date'].max(),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_combined_label(df, cols, sep=' | '):
+    def combine_row(row):
+        parts = []
+        for val in row:
+            if pd.isna(val):
+                continue
+            sval = str(val).strip()
+            if not sval or sval.lower() == 'nan':
+                continue
+            parts.append(sval)
+        return sep.join(parts)
+
+    return df[cols].apply(combine_row, axis=1)
 
 
 def format_indexed_table(table, segments, periods, value_formatter):
@@ -348,6 +395,16 @@ with tabs_main[0]:
         'Post': (post_start, post_end),
     }
 
+    source_mode = 'None'
+    meta_pattern = ''
+    include_unknown_source = True
+    include_other_source = False
+    apply_groups_to_non_meta = True
+    include_non_meta_other = True
+    source_groups_key = key('gen', 'source_groups')
+    if source_groups_key not in st.session_state:
+        st.session_state[source_groups_key] = []
+
     with st.expander('Filters', expanded=True):
         if region_col != '(none)':
             region_values = sorted([v for v in working_df[region_col].dropna().unique()])
@@ -369,21 +426,91 @@ with tabs_main[0]:
             st.info('Select a region column to enable region filtering.')
 
         if source_col != '(none)':
-            default_pattern = r'fb|fbig|facebook|meta|insta'
-            meta_pattern = st.text_input(
-                'Meta source pattern (regex)',
-                value=default_pattern,
-                key=key('gen', 'meta_pattern')
+            st.markdown('**Source segmentation**')
+            source_mode = st.radio(
+                'Source segmentation mode',
+                ['Meta regex', 'Custom groups', 'Meta + Custom groups'],
+                horizontal=True,
+                key=key('gen', 'source_mode')
             )
-            include_unknown_source = st.checkbox(
-                'Include unknown source in Non-Meta',
-                value=True,
-                key=key('gen', 'include_unknown_source')
-            )
+
+            if source_mode in ['Meta regex', 'Meta + Custom groups']:
+                default_pattern = r'fb|fbig|facebook|meta|insta'
+                meta_pattern = st.text_input(
+                    'Meta source pattern (regex)',
+                    value=default_pattern,
+                    key=key('gen', 'meta_pattern')
+                )
+                include_unknown_source = st.checkbox(
+                    'Include unknown source in Non-Meta/Other',
+                    value=True,
+                    key=key('gen', 'include_unknown_source')
+                )
+
+            if source_mode in ['Custom groups', 'Meta + Custom groups']:
+                source_values = sorted(
+                    working_df[source_col].dropna().astype('string').unique()
+                )
+                group_name = st.text_input('Group name', key=key('gen', 'group_name'))
+                group_values = st.multiselect(
+                    'Group values',
+                    source_values,
+                    key=key('gen', 'group_values')
+                )
+                add_group = st.button('Add group', key=key('gen', 'add_group'))
+                if add_group and group_name.strip() and group_values:
+                    new_name = group_name.strip()
+                    st.session_state[source_groups_key] = [
+                        g for g in st.session_state[source_groups_key]
+                        if g['name'] != new_name
+                    ] + [{'name': new_name, 'values': group_values}]
+                    st.rerun()
+
+                if st.session_state[source_groups_key]:
+                    group_names = [g['name'] for g in st.session_state[source_groups_key]]
+                    st.caption('Current groups:')
+                    for group in st.session_state[source_groups_key]:
+                        st.write(f"- {group['name']}: {', '.join(str(v) for v in group['values'][:6])}")
+                    remove_name = st.selectbox(
+                        'Remove group',
+                        ['(none)'] + group_names,
+                        key=key('gen', 'remove_group')
+                    )
+                    remove_group = st.button('Remove', key=key('gen', 'remove_group_btn'))
+                    if remove_group and remove_name != '(none)':
+                        st.session_state[source_groups_key] = [
+                            g for g in st.session_state[source_groups_key]
+                            if g['name'] != remove_name
+                        ]
+                        st.rerun()
+                else:
+                    st.info('Add at least one group to enable custom source segmentation.')
+
+                if source_mode == 'Custom groups':
+                    include_other_source = st.checkbox(
+                        'Include Other sources',
+                        value=True,
+                        key=key('gen', 'include_other_source')
+                    )
+                    include_unknown_source = st.checkbox(
+                        'Include unknown in Other',
+                        value=True,
+                        key=key('gen', 'include_unknown_source_custom')
+                    )
+                else:
+                    apply_groups_to_non_meta = st.checkbox(
+                        'Apply custom groups to Non-Meta only',
+                        value=True,
+                        key=key('gen', 'apply_groups_non_meta')
+                    )
+                    include_non_meta_other = st.checkbox(
+                        'Include Non-Meta Other',
+                        value=True,
+                        key=key('gen', 'include_non_meta_other')
+                    )
         else:
-            meta_pattern = ''
             include_unknown_source = True
-            st.warning('Select a source column to enable Meta vs Non-Meta segmentation.')
+            st.warning('Select a source column to enable source segmentation.')
 
     numeric_cols = [c for c in working_df.select_dtypes(include='number').columns if c != 'date']
 
@@ -410,6 +537,12 @@ with tabs_main[0]:
         st.session_state[custom_ratios_key] = {}
 
     ratio_defs.update(st.session_state[custom_ratios_key])
+    ratio_defs, missing_ratios = filter_ratio_defs(ratio_defs, working_df.columns)
+    if missing_ratios:
+        st.warning(
+            'Some ratios were hidden because columns are missing: '
+            + ', '.join(missing_ratios)
+        )
 
     if selected_metrics_key not in st.session_state:
         st.session_state[selected_metrics_key] = list(ratio_defs.keys())
@@ -498,10 +631,10 @@ with tabs_main[0]:
     ratios = {k: v for k, v in ratio_defs.items() if k in st.session_state[selected_metrics_key]}
 
     raw_metrics = st.multiselect(
-        'Raw metrics (totals)',
+        'Raw metrics (daily average)',
         numeric_cols,
         default=[],
-        help='These are summed over the selected period and segment.',
+        help='These are summed by day, then averaged over the selected period and segment.',
         key=key('gen', 'raw_metrics'),
     )
     if region_col != '(none)' and focus_regions:
@@ -512,9 +645,8 @@ with tabs_main[0]:
         else:
             other_mask = (~focus_mask) & region_series.notna()
         show_other = True
-        focus_label = f"{region_col}: {', '.join(str(v) for v in focus_regions[:3])}"
-        if len(focus_regions) > 3:
-            focus_label += ' ...'
+        normalized_regions = [str(v).strip().replace(' ', '_') for v in focus_regions]
+        focus_label = f"{region_col}: {'_'.join(normalized_regions)}"
         other_label = 'All Other Regions'
     else:
         focus_mask = pd.Series(True, index=working_df.index)
@@ -523,26 +655,100 @@ with tabs_main[0]:
         focus_label = 'All Data'
         other_label = 'All Other Regions'
 
+    source_segments = {'All Data': pd.Series(True, index=working_df.index)}
+    segment_note = '(All Data)'
     if source_col != '(none)':
-        source_series = working_df[source_col].astype('string').str.strip().str.lower()
-        try:
-            pattern = re.compile(meta_pattern, flags=re.IGNORECASE)
-        except re.error as exc:
-            st.error(f'Invalid regex pattern: {exc}')
-            st.stop()
-        meta_mask = source_series.str.contains(pattern, na=False)
-        if include_unknown_source:
-            non_meta_mask = ~meta_mask
+        source_series = working_df[source_col].astype('string').str.strip()
+        source_norm = source_series.str.lower()
+
+        if source_mode in ['Meta regex', 'Meta + Custom groups']:
+            try:
+                pattern = re.compile(meta_pattern, flags=re.IGNORECASE)
+            except re.error as exc:
+                st.error(f'Invalid regex pattern: {exc}')
+                st.stop()
+            meta_mask = source_norm.str.contains(pattern, na=False)
         else:
-            non_meta_mask = (~meta_mask) & source_series.notna()
-        source_segments = {'Meta': meta_mask, 'Non-Meta': non_meta_mask}
-        segment_note = '(Meta vs Non-Meta)'
-    else:
-        source_segments = {'All Data': pd.Series(True, index=working_df.index)}
-        segment_note = '(All Data)'
+            meta_mask = pd.Series(False, index=working_df.index)
+
+        if source_mode == 'Meta regex':
+            if include_unknown_source:
+                non_meta_mask = ~meta_mask
+            else:
+                non_meta_mask = (~meta_mask) & source_series.notna()
+            source_segments = {'Meta': meta_mask, 'Non-Meta': non_meta_mask}
+            segment_note = '(Meta vs Non-Meta)'
+        elif source_mode == 'Custom groups':
+            groups = st.session_state[source_groups_key]
+            if groups:
+                used_mask = pd.Series(False, index=working_df.index)
+                source_segments = {}
+                for group in groups:
+                    values = [str(v).lower() for v in group['values']]
+                    mask = source_norm.isin(values)
+                    source_segments[group['name']] = mask
+                    used_mask = used_mask | mask
+                if include_other_source:
+                    other_mask = ~used_mask
+                    if not include_unknown_source:
+                        other_mask = other_mask & source_series.notna()
+                    source_segments['Other'] = other_mask
+                segment_note = '(Custom source groups)'
+        else:
+            groups = st.session_state[source_groups_key]
+            if groups:
+                used_mask = pd.Series(False, index=working_df.index)
+                source_segments = {'Meta': meta_mask}
+                for group in groups:
+                    values = [str(v).lower() for v in group['values']]
+                    group_mask = source_norm.isin(values)
+                    if apply_groups_to_non_meta:
+                        group_mask = group_mask & (~meta_mask)
+                    source_segments[group['name']] = group_mask
+                    used_mask = used_mask | group_mask
+
+                if include_non_meta_other:
+                    other_mask = ~meta_mask & ~used_mask
+                    if not include_unknown_source:
+                        other_mask = other_mask & source_series.notna()
+                    source_segments['Non-Meta Other'] = other_mask
+                segment_note = '(Meta + custom groups)'
+            else:
+                if include_unknown_source:
+                    non_meta_mask = ~meta_mask
+                else:
+                    non_meta_mask = (~meta_mask) & source_series.notna()
+                source_segments = {'Meta': meta_mask, 'Non-Meta': non_meta_mask}
+                segment_note = '(Meta vs Non-Meta)'
 
     focus_segments = {label: focus_mask & mask for label, mask in source_segments.items()}
     other_segments = {label: other_mask & mask for label, mask in source_segments.items()}
+
+    with st.expander('Data preview (post-filters)', expanded=False):
+        st.write(f'Rows: {len(working_df):,}')
+        st.write(f'Date range: {min_date.date()} to {max_date.date()}')
+        st.write(f'Date column: {date_col}')
+        st.write(f'Source column: {source_col}')
+        st.write(f'Region column: {region_col}')
+        focus_label_preview = '_'.join(
+            [str(v).strip().replace(' ', '_') for v in focus_regions]
+        ) if focus_regions else 'All'
+        st.write(f'Focus regions: {focus_label_preview}')
+        st.write(f'Source mode: {source_mode}')
+        if source_mode in ['Meta regex', 'Meta + Custom groups']:
+            st.write(f'Meta pattern: {meta_pattern}')
+        if source_mode in ['Custom groups', 'Meta + Custom groups']:
+            group_list = [g["name"] for g in st.session_state[source_groups_key]]
+            st.write(f'Source groups: {", ".join(group_list) if group_list else "None"}')
+        st.write('Segment counts')
+        st.dataframe(build_segment_preview(working_df, focus_segments), use_container_width=True)
+        if show_other:
+            st.dataframe(build_segment_preview(working_df, other_segments), use_container_width=True)
+        st.write('Sample rows (focus)')
+        st.dataframe(working_df.loc[focus_mask].head(20), use_container_width=True)
+        if show_other:
+            st.write('Sample rows (other)')
+            st.dataframe(working_df.loc[other_mask].head(20), use_container_width=True)
 
     ratio_focus_table = compute_ratio_table(working_df, ratios, periods, focus_segments)
     raw_focus_table = compute_sum_table(working_df, raw_metrics, periods, focus_segments)
@@ -614,7 +820,7 @@ with tabs_main[0]:
                     use_container_width=True
                 )
 
-    st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment.')
+    st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment. Raw metrics are daily averages.')
 with tabs_main[1]:
     st.subheader('Shopify + Meta Controls')
     row1 = st.columns([2.0, 2.0, 1.0, 2.0, 2.0, 1.0])
@@ -699,6 +905,14 @@ with tabs_main[1]:
         st.error('Date column not found in Shopify or Meta dataset.')
         st.stop()
 
+    pivot_groups_key = key('sm', 'pivot_groups')
+    if pivot_groups_key not in st.session_state:
+        st.session_state[pivot_groups_key] = []
+
+    pivot_mode = 'Use raw categories'
+    include_other_pivot = True
+    include_unknown_pivot = True
+
     with st.expander('Shopify + Meta settings', expanded=True):
         shopify_date_col = st.selectbox(
             'Shopify date column',
@@ -725,11 +939,12 @@ with tabs_main[1]:
         if not default_cat and shopify_non_numeric:
             default_cat = shopify_non_numeric[0]
 
-        cat_col = st.selectbox(
-            'Shopify category column',
+        default_pivot_cols = [default_cat] if default_cat else []
+        pivot_cols = st.multiselect(
+            'Shopify pivot columns',
             shopify_non_numeric,
-            index=shopify_non_numeric.index(default_cat) if default_cat in shopify_non_numeric else 0,
-            key=key('sm', 'shopify_cat_col')
+            default=default_pivot_cols,
+            key=key('sm', 'shopify_pivot_cols')
         )
 
         shopify_numeric = [
@@ -745,6 +960,65 @@ with tabs_main[1]:
             default=default_metrics,
             key=key('sm', 'shopify_metrics')
         )
+
+        pivot_mode = st.radio(
+            'Pivot categories',
+            ['Use raw categories', 'Consolidate categories'],
+            horizontal=True,
+            key=key('sm', 'pivot_mode')
+        )
+
+        if pivot_mode == 'Consolidate categories':
+            if not pivot_cols:
+                st.error('Select at least one pivot column.')
+                st.stop()
+            temp_labels = build_combined_label(shopify_df, pivot_cols)
+            category_values = sorted(temp_labels.dropna().unique())
+            group_name = st.text_input('Group name', key=key('sm', 'pivot_group_name'))
+            group_values = st.multiselect(
+                'Group values',
+                category_values,
+                key=key('sm', 'pivot_group_values')
+            )
+            add_group = st.button('Add pivot group', key=key('sm', 'pivot_add_group'))
+            if add_group and group_name.strip() and group_values:
+                new_name = group_name.strip()
+                st.session_state[pivot_groups_key] = [
+                    g for g in st.session_state[pivot_groups_key]
+                    if g['name'] != new_name
+                ] + [{'name': new_name, 'values': group_values}]
+                st.rerun()
+
+            if st.session_state[pivot_groups_key]:
+                group_names = [g['name'] for g in st.session_state[pivot_groups_key]]
+                st.caption('Current pivot groups:')
+                for group in st.session_state[pivot_groups_key]:
+                    st.write(f"- {group['name']}: {', '.join(str(v) for v in group['values'][:6])}")
+                remove_name = st.selectbox(
+                    'Remove pivot group',
+                    ['(none)'] + group_names,
+                    key=key('sm', 'pivot_remove_group')
+                )
+                remove_group = st.button('Remove', key=key('sm', 'pivot_remove_group_btn'))
+                if remove_group and remove_name != '(none)':
+                    st.session_state[pivot_groups_key] = [
+                        g for g in st.session_state[pivot_groups_key]
+                        if g['name'] != remove_name
+                    ]
+                    st.rerun()
+            else:
+                st.info('Add at least one group to consolidate categories.')
+
+            include_other_pivot = st.checkbox(
+                'Include Other categories',
+                value=True,
+                key=key('sm', 'pivot_include_other')
+            )
+            include_unknown_pivot = st.checkbox(
+                'Include unknown in Other',
+                value=True,
+                key=key('sm', 'pivot_include_unknown')
+            )
 
     shopify_df['date'] = normalize_date(shopify_df[shopify_date_col])
     meta_df['date'] = normalize_date(meta_df[meta_date_col])
@@ -768,16 +1042,47 @@ with tabs_main[1]:
     shopify_df = shopify_df[(shopify_df['date'] >= overlap_start) & (shopify_df['date'] <= overlap_end)]
     meta_df = meta_df[(meta_df['date'] >= overlap_start) & (meta_df['date'] <= overlap_end)]
 
-    shopify_df[cat_col] = shopify_df[cat_col].astype('string').str.strip().str.title()
-    shopify_df = shopify_df[shopify_df[cat_col].notna()]
+    if not pivot_cols:
+        st.error('Select at least one pivot column.')
+        st.stop()
+
+    for col in pivot_cols:
+        shopify_df[col] = shopify_df[col].astype('string').str.strip()
+
+    shopify_df['pivot_base'] = build_combined_label(shopify_df, pivot_cols)
+    shopify_df = shopify_df[shopify_df['pivot_base'].notna()]
+    shopify_df = shopify_df[shopify_df['pivot_base'].str.len() > 0]
+
+    pivot_col = 'pivot_base'
+    if pivot_mode == 'Consolidate categories':
+        groups = st.session_state[pivot_groups_key]
+        if groups:
+            cat_series = shopify_df[pivot_col].astype('string')
+            cat_norm = cat_series.str.lower()
+            group_map = {}
+            for group in groups:
+                for value in group['values']:
+                    group_map[str(value).lower()] = group['name']
+            group_series = cat_norm.map(group_map)
+            if include_other_pivot:
+                if include_unknown_pivot:
+                    group_series = group_series.fillna('Other')
+                else:
+                    group_series = group_series.where(cat_series.notna())
+                    group_series = group_series.fillna('Other')
+            else:
+                group_series = group_series.where(group_series.notna())
+            shopify_df = shopify_df[group_series.notna()].copy()
+            shopify_df['pivot_group'] = group_series
+            pivot_col = 'pivot_group'
 
     shopify_grouped = (
-        shopify_df.groupby(['date', cat_col], as_index=False)[shopify_metrics]
+        shopify_df.groupby(['date', pivot_col], as_index=False)[shopify_metrics]
         .sum()
     )
-    shopify_pivot = shopify_grouped.pivot(index='date', columns=cat_col, values=shopify_metrics)
+    shopify_pivot = shopify_grouped.pivot(index='date', columns=pivot_col, values=shopify_metrics)
     shopify_pivot.columns = [
-        f"shopify_{metric.lower().replace(' ', '_')}_{cat.lower()}"
+        f"shopify_{metric.lower().replace(' ', '_')}_{str(cat).lower().replace(' ', '_')}"
         for metric, cat in shopify_pivot.columns
     ]
     shopify_pivot = shopify_pivot.reset_index().fillna(0)
@@ -794,6 +1099,15 @@ with tabs_main[1]:
     if merged.empty:
         st.error('Merged Shopify + Meta dataset is empty after pivot/merge.')
         st.stop()
+
+    with st.expander('Data preview', expanded=False):
+        st.write(f'Shopify rows: {len(shopify_df):,}')
+        st.write(f'Meta rows: {len(meta_df):,}')
+        st.write(f'Merged rows: {len(merged):,}')
+        st.dataframe(shopify_df.head(20), use_container_width=True)
+        st.dataframe(shopify_pivot.head(20), use_container_width=True)
+        st.dataframe(meta_agg.head(20), use_container_width=True)
+        st.dataframe(merged.head(20), use_container_width=True)
     min_date = merged['date'].min()
     max_date = merged['date'].max()
 
@@ -863,6 +1177,12 @@ with tabs_main[1]:
         st.session_state[custom_ratios_key] = {}
 
     ratio_defs.update(st.session_state[custom_ratios_key])
+    ratio_defs, missing_ratios = filter_ratio_defs(ratio_defs, merged.columns)
+    if missing_ratios:
+        st.warning(
+            'Some ratios were hidden because columns are missing: '
+            + ', '.join(missing_ratios)
+        )
 
     if selected_metrics_key not in st.session_state:
         st.session_state[selected_metrics_key] = list(ratio_defs.keys())
@@ -951,10 +1271,10 @@ with tabs_main[1]:
     ratios = {k: v for k, v in ratio_defs.items() if k in st.session_state[selected_metrics_key]}
 
     raw_metrics = st.multiselect(
-        'Raw metrics (totals)',
+        'Raw metrics (daily average)',
         numeric_cols,
         default=[],
-        help='These are summed over the selected period.',
+        help='These are summed by day, then averaged over the selected period.',
         key=key('sm', 'raw_metrics'),
     )
 
@@ -992,4 +1312,4 @@ with tabs_main[1]:
                 use_container_width=True
             )
 
-    st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment.')
+    st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment. Raw metrics are daily averages.')
