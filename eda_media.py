@@ -96,7 +96,14 @@ def compute_ratio_table(df, ratios, periods, masks):
     return pd.DataFrame(rows)
 
 
-def compute_sum_table(df, metrics, periods, masks):
+def is_weighted_avg_metric(metric_name):
+    name = metric_name.lower()
+    if 'session duration' not in name:
+        return False
+    return 'avg' in name or 'average' in name
+
+
+def compute_sum_table(df, metrics, periods, masks, divisors=None, session_col='Sessions'):
     rows = []
     for metric_col in metrics:
         row = {'Metric': metric_col}
@@ -104,10 +111,20 @@ def compute_sum_table(df, metrics, periods, masks):
             for period_label, (start, end) in periods.items():
                 period_df = df[(df['date'] >= start) & (df['date'] <= end) & mask]
                 if period_df.empty:
+                    total = np.nan
+                elif is_weighted_avg_metric(metric_col) and session_col in period_df.columns:
+                    weighted_sum = (period_df[metric_col] * period_df[session_col]).sum()
+                    session_total = period_df[session_col].sum()
+                    total = weighted_sum / session_total if session_total else np.nan
+                else:
+                    total = period_df[metric_col].sum()
+                divisor = 1
+                if divisors and label in divisors and divisors[label]:
+                    divisor = divisors[label]
+                if divisor in [0, None] or pd.isna(divisor):
                     value = np.nan
                 else:
-                    daily_totals = period_df.groupby('date')[metric_col].sum()
-                    value = daily_totals.mean()
+                    value = total / divisor
                 row[f'{label} {period_label}'] = value
         rows.append(row)
 
@@ -631,10 +648,10 @@ with tabs_main[0]:
     ratios = {k: v for k, v in ratio_defs.items() if k in st.session_state[selected_metrics_key]}
 
     raw_metrics = st.multiselect(
-        'Raw metrics (daily average)',
+        'Raw metrics (period total / region count)',
         numeric_cols,
         default=[],
-        help='These are summed by day, then averaged over the selected period and segment.',
+        help='These are period totals divided by the number of focus/other regions.',
         key=key('gen', 'raw_metrics'),
     )
     if region_col != '(none)' and focus_regions:
@@ -697,20 +714,25 @@ with tabs_main[0]:
         else:
             groups = st.session_state[source_groups_key]
             if groups:
+                if include_unknown_source:
+                    non_meta_mask = ~meta_mask
+                else:
+                    non_meta_mask = (~meta_mask) & source_series.notna()
                 used_mask = pd.Series(False, index=working_df.index)
-                source_segments = {'Meta': meta_mask}
+                source_segments = {'Meta': meta_mask, 'Non-Meta': non_meta_mask}
                 for group in groups:
                     values = [str(v).lower() for v in group['values']]
                     group_mask = source_norm.isin(values)
                     if apply_groups_to_non_meta:
                         group_mask = group_mask & (~meta_mask)
-                    source_segments[group['name']] = group_mask
+                    group_name = group['name']
+                    if group_name in source_segments:
+                        group_name = f'{group_name} (group)'
+                    source_segments[group_name] = group_mask
                     used_mask = used_mask | group_mask
 
                 if include_non_meta_other:
-                    other_mask = ~meta_mask & ~used_mask
-                    if not include_unknown_source:
-                        other_mask = other_mask & source_series.notna()
+                    other_mask = non_meta_mask & ~used_mask
                     source_segments['Non-Meta Other'] = other_mask
                 segment_note = '(Meta + custom groups)'
             else:
@@ -723,6 +745,18 @@ with tabs_main[0]:
 
     focus_segments = {label: focus_mask & mask for label, mask in source_segments.items()}
     other_segments = {label: other_mask & mask for label, mask in source_segments.items()}
+
+    focus_region_count = 1
+    other_region_count = np.nan
+    if region_col != '(none)':
+        if focus_regions:
+            focus_region_count = len(focus_regions)
+        else:
+            focus_region_count = max(1, region_series[focus_mask].dropna().nunique())
+        if show_other:
+            other_region_count = region_series[other_mask].dropna().nunique()
+            if other_region_count == 0:
+                other_region_count = np.nan
 
     with st.expander('Data preview (post-filters)', expanded=False):
         st.write(f'Rows: {len(working_df):,}')
@@ -740,6 +774,13 @@ with tabs_main[0]:
         if source_mode in ['Custom groups', 'Meta + Custom groups']:
             group_list = [g["name"] for g in st.session_state[source_groups_key]]
             st.write(f'Source groups: {", ".join(group_list) if group_list else "None"}')
+        st.write(f'Focus region divisor: {focus_region_count}')
+        if show_other:
+            st.write(
+                f'Other region divisor: '
+                f'{other_region_count if not pd.isna(other_region_count) else "N/A"}'
+            )
+        st.write('Raw metric rule: totals / region count; Average session duration uses sessions-weighted average.')
         st.write('Segment counts')
         st.dataframe(build_segment_preview(working_df, focus_segments), use_container_width=True)
         if show_other:
@@ -751,10 +792,16 @@ with tabs_main[0]:
             st.dataframe(working_df.loc[other_mask].head(20), use_container_width=True)
 
     ratio_focus_table = compute_ratio_table(working_df, ratios, periods, focus_segments)
-    raw_focus_table = compute_sum_table(working_df, raw_metrics, periods, focus_segments)
+    focus_divisors = {label: focus_region_count for label in focus_segments}
+    raw_focus_table = compute_sum_table(
+        working_df, raw_metrics, periods, focus_segments, divisors=focus_divisors
+    )
 
     ratio_other_table = compute_ratio_table(working_df, ratios, periods, other_segments)
-    raw_other_table = compute_sum_table(working_df, raw_metrics, periods, other_segments)
+    other_divisors = {label: other_region_count for label in other_segments}
+    raw_other_table = compute_sum_table(
+        working_df, raw_metrics, periods, other_segments, divisors=other_divisors
+    )
 
     segment_labels = list(focus_segments.keys())
     period_labels = list(periods.keys())
@@ -800,6 +847,7 @@ with tabs_main[0]:
 
     with tabs[1]:
         st.subheader(f'{focus_label} {segment_note}')
+        st.caption(f'Raw metric divisor: {focus_region_count}')
         if raw_focus_table_display.empty:
             st.info('No raw metrics selected or no data for the selected filters.')
         else:
@@ -809,18 +857,26 @@ with tabs_main[0]:
                 use_container_width=True
             )
 
-        if show_other:
-            st.subheader(f'{other_label} {segment_note}')
-            if raw_other_table_display.empty:
-                st.info('No raw metrics selected or no data for the selected filters.')
-            else:
-                raw_other_styles = build_index_styles(raw_other_index, highlight_periods)
-                st.dataframe(
+    if show_other:
+        st.subheader(f'{other_label} {segment_note}')
+        st.caption(
+            f'Raw metric divisor: '
+            f'{other_region_count if not pd.isna(other_region_count) else "N/A"}'
+        )
+        if raw_other_table_display.empty:
+            st.info('No raw metrics selected or no data for the selected filters.')
+        else:
+            raw_other_styles = build_index_styles(raw_other_index, highlight_periods)
+            st.dataframe(
                     raw_other_table_display.style.apply(lambda _: raw_other_styles, axis=None),
                     use_container_width=True
                 )
 
-    st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment. Raw metrics are daily averages.')
+st.caption(
+    'Notes: Each cell is value (index). Index uses Pre = 100 for each segment. '
+    'Raw metrics are period totals divided by region count. '
+    'Average session duration uses sessions-weighted average before the divisor.'
+)
 with tabs_main[1]:
     st.subheader('Shopify + Meta Controls')
     row1 = st.columns([2.0, 2.0, 1.0, 2.0, 2.0, 1.0])
@@ -1271,10 +1327,10 @@ with tabs_main[1]:
     ratios = {k: v for k, v in ratio_defs.items() if k in st.session_state[selected_metrics_key]}
 
     raw_metrics = st.multiselect(
-        'Raw metrics (daily average)',
+        'Raw metrics (period totals)',
         numeric_cols,
         default=[],
-        help='These are summed by day, then averaged over the selected period.',
+        help='These are summed over the selected period.',
         key=key('sm', 'raw_metrics'),
     )
 
@@ -1282,7 +1338,7 @@ with tabs_main[1]:
     segments = {'All Data': pd.Series(True, index=merged.index)}
 
     ratio_table = compute_ratio_table(merged, ratios, periods, segments)
-    raw_table = compute_sum_table(merged, raw_metrics, periods, segments)
+    raw_table = compute_sum_table(merged, raw_metrics, periods, segments, divisors=None)
 
     period_labels = list(periods.keys())
     highlight_periods = ['Campaign', 'Post']
@@ -1312,4 +1368,4 @@ with tabs_main[1]:
                 use_container_width=True
             )
 
-    st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment. Raw metrics are daily averages.')
+st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment.')
