@@ -1,1691 +1,995 @@
-# app.py  (FAST: Excel -> Parquet cache -> DuckDB queries)
-import hashlib
+
+import io
 import re
+from datetime import timedelta
 from pathlib import Path
 
-import duckdb
+import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
-from pandas.io.formats.style import Styler
 
-st.set_page_config(page_title="GA Deep Dive (Fast)", layout="wide")
+st.set_page_config(page_title='Campaign Comparison', layout='wide')
 
-META_PATTERN = r"(fb|fbig|facebook|meta|insta)"
-CACHE_DIR = Path(".ga_cache")
-CACHE_DIR.mkdir(exist_ok=True)
-PROFESSIONAL_PALETTE = ["#1f5065", "#2d6a7c", "#4b8199", "#75a6bf", "#a4c9e1", "#cfe0f2"]
-
-st.markdown(
-    """
-    <style>
-      .stTabs [data-baseweb="tab"] {
-        font-size: 16px;
-        font-weight: 600;
-        padding: 10px 16px;
-      }
-      .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_DATA = BASE_DIR / '01 Raw Data' / 'GA_RegionMapped.xlsx'
 
 
-# ---------------- helpers ----------------
-def file_md5(uploaded_file) -> str:
-    return hashlib.md5(uploaded_file.getvalue()).hexdigest()
+@st.cache_data(show_spinner=False)
+def load_data_path(path, sheet_name=None):
+    ext = Path(path).suffix.lower()
+    if ext in ['.xlsx', '.xls']:
+        if sheet_name:
+            return pd.read_excel(path, sheet_name=sheet_name)
+        return pd.read_excel(path)
+    return pd.read_csv(path)
 
 
-def sanitize_name(s: str | None) -> str:
-    return re.sub(r"[^a-zA-Z0-9_]+", "_", str(s or "sheet")).strip("_") or "sheet"
+@st.cache_data(show_spinner=False)
+def load_data_bytes(file_bytes, filename, sheet_name=None):
+    ext = Path(filename).suffix.lower()
+    buffer = io.BytesIO(file_bytes)
+    if ext in ['.xlsx', '.xls']:
+        if sheet_name:
+            return pd.read_excel(buffer, sheet_name=sheet_name)
+        return pd.read_excel(buffer)
+    return pd.read_csv(buffer)
 
 
-def safe_ident(col: str, allowed: list[str]) -> str:
-    if col not in allowed:
-        raise ValueError(f"Invalid column: {col}")
-    return '"' + col.replace('"', '""') + '"'
+def list_sheets_from_upload(file_bytes):
+    try:
+        excel = pd.ExcelFile(io.BytesIO(file_bytes))
+        return excel.sheet_names
+    except Exception:
+        return []
 
 
-def quoted_alias(name: str) -> str:
-    return '"' + str(name).replace('"', '""') + '"'
+def list_sheets_from_path(path):
+    try:
+        excel = pd.ExcelFile(path)
+        return excel.sheet_names
+    except Exception:
+        return []
 
 
-def minmax_scale_per_series(long_df: pd.DataFrame, series_col="series", value_col="value") -> pd.DataFrame:
-    d = long_df.copy()
-    g = d.groupby(series_col)[value_col]
-    vmin = g.transform("min")
-    vmax = g.transform("max")
-    denom = (vmax - vmin)
-    d[value_col] = (d[value_col] - vmin) / denom.replace(0, pd.NA)
-    d[value_col] = d[value_col].fillna(0)
-    return d
+def find_date_candidates(df):
+    keywords = ['date', 'day', 'time', 'dt']
+    candidates = [c for c in df.columns if any(k in c.lower() for k in keywords)]
+    if candidates:
+        return candidates
 
-
-def _is_csv_file(uploaded_file) -> bool:
-    return Path(uploaded_file.name).suffix.lower() == ".csv"
-
-
-def get_columns_header_only(uploaded_file, sheet_name: str | None) -> list[str]:
-    uploaded_file.seek(0)
-    if _is_csv_file(uploaded_file):
-        hdr = pd.read_csv(uploaded_file, nrows=0)
-    else:
-        hdr = pd.read_excel(uploaded_file, sheet_name=sheet_name, nrows=0, engine="openpyxl")
-    uploaded_file.seek(0)
-    return list(hdr.columns)
-
-
-def ensure_parquet(uploaded_file, sheet_name: str | None, date_col: str) -> Path:
-    uploaded_file.seek(0)
-    h = file_md5(uploaded_file)
-    sheet_token = sanitize_name(sheet_name or ".csv")
-    out = CACHE_DIR / f"{h}__{sheet_token}__{sanitize_name(date_col)}.parquet"
-    if out.exists():
-        uploaded_file.seek(0)
-        return out
-
-    if _is_csv_file(uploaded_file):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine="openpyxl")
-    uploaded_file.seek(0)
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None).dt.normalize()
-    df = df.dropna(subset=[date_col])
-    df.to_parquet(out, index=False)
-    return out
-
-
-def duckdb_connect_view(parquet_path: Path) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(database=":memory:")
-    con.execute("PRAGMA threads=4;")
-    con.execute("PRAGMA enable_object_cache=true;")
-    path_sql = parquet_path.as_posix().replace("'", "''")
-    con.execute("CREATE OR REPLACE VIEW t AS SELECT * FROM read_parquet('" + path_sql + "');")
-    return con
-
-
-def get_numeric_metrics(con: duckdb.DuckDBPyConnection, all_cols: list[str], exclude: set[str]) -> list[str]:
-    desc = con.execute("DESCRIBE SELECT * FROM t;").df()
-    numeric_types = re.compile(
-        r"(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|FLOAT|REAL|DOUBLE|DECIMAL|NUMERIC)",
-        re.I,
-    )
-    metrics = []
-    for _, r in desc.iterrows():
-        name = str(r["column_name"])
-        ctype = str(r["column_type"])
-        if name in exclude:
+    sample = df.head(1000)
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            candidates.append(col)
             continue
-        if numeric_types.search(ctype):
-            metrics.append(name)
-    return [c for c in all_cols if c in metrics]
+        parsed = pd.to_datetime(sample[col], errors='coerce')
+        if parsed.notna().mean() >= 0.6:
+            candidates.append(col)
 
+    return list(dict.fromkeys(candidates))
 
-def _meta_where(src_sql: str, want_meta: bool) -> tuple[str, list]:
-    if want_meta:
-        return f"regexp_matches(lower({src_sql}), ?)", [META_PATTERN]
-    return f"NOT regexp_matches(lower({src_sql}), ?)", [META_PATTERN]
 
+def normalize_date(series):
+    return pd.to_datetime(series, errors='coerce').dt.normalize()
 
-def _meta_mode_where(src_sql: str, mode: str) -> tuple[str, list]:
-    normalized = (mode or "").lower()
-    if normalized == "meta":
-        return f"regexp_matches(lower({src_sql}), ?)", [META_PATTERN]
-    if normalized == "other":
-        return f"NOT regexp_matches(lower({src_sql}), ?)", [META_PATTERN]
-    return "1=1", []
 
+def ratio_value(df, numerator, denominator):
+    num = df[numerator].sum()
+    den = df[denominator].sum()
+    if den == 0:
+        return np.nan
+    return num / den
 
-def fetch_agg_for_plot(
-    con: duckdb.DuckDBPyConnection,
-    allowed_cols: list[str],
-    source_col: str,
-    date_col: str,
-    metrics: list[str],
-    region_col: str | None,
-    regions_selected: list[str],
-    agg_fn: str,
-    start_d: pd.Timestamp,
-    end_d: pd.Timestamp,
-    want_meta: bool,
-) -> pd.DataFrame:
-    """
-    Plot data: group by day (+ region if chosen). Metrics are aggregated and returned wide.
-    """
-    if not metrics:
-        return pd.DataFrame()
 
-    src = safe_ident(source_col, allowed_cols)
-    dt = safe_ident(date_col, allowed_cols)
-    rg = safe_ident(region_col, allowed_cols) if region_col else None
-    agg_sql = "SUM" if agg_fn == "sum" else "AVG"
-
-    metric_exprs = []
-    for m in metrics:
-        m_id = safe_ident(m, allowed_cols)
-        metric_exprs.append(f'COALESCE({agg_sql}(TRY_CAST({m_id} AS DOUBLE)), 0) AS {quoted_alias(m)}')
-
-    select_cols = [f"CAST({dt} AS DATE) AS day"]
-    group_cols = ["day"]
-    where_clauses = [f"CAST({dt} AS DATE) BETWEEN ? AND ?"]
-    params: list = [start_d.date(), end_d.date()]
-
-    mw, mw_params = _meta_where(src, want_meta)
-    where_clauses.append(mw)
-    params.extend(mw_params)
-
-    if region_col:
-        select_cols.append(f"CAST({rg} AS VARCHAR) AS region")
-        group_cols.append("region")
-        if regions_selected:
-            placeholders = ",".join(["?"] * len(regions_selected))
-            where_clauses.append(f"CAST({rg} AS VARCHAR) IN ({placeholders})")
-            params.extend(regions_selected)
-
-    sql = f"""
-        SELECT
-          {", ".join(select_cols)},
-          {", ".join(metric_exprs)}
-        FROM t
-        WHERE {" AND ".join(where_clauses)}
-        GROUP BY {", ".join(group_cols)}
-        ORDER BY {", ".join(group_cols)}
-    """
-    return con.execute(sql, params).df()
-
-
-def fetch_agg_day_only_for_corr(
-    con: duckdb.DuckDBPyConnection,
-    allowed_cols: list[str],
-    source_col: str,
-    date_col: str,
-    metrics: list[str],
-    region_col: str | None,
-    regions_selected: list[str],
-    agg_fn: str,
-    start_d: pd.Timestamp,
-    end_d: pd.Timestamp,
-    want_meta: bool,
-) -> pd.DataFrame:
-    """
-    Correlation data: group by day ONLY (even if region is selected), but keep region filter if selected.
-    This avoids correlation explosion across many region lines.
-    """
-    if not metrics:
-        return pd.DataFrame()
-
-    src = safe_ident(source_col, allowed_cols)
-    dt = safe_ident(date_col, allowed_cols)
-    rg = safe_ident(region_col, allowed_cols) if region_col else None
-    agg_sql = "SUM" if agg_fn == "sum" else "AVG"
-
-    metric_exprs = []
-    for m in metrics:
-        m_id = safe_ident(m, allowed_cols)
-        metric_exprs.append(f'COALESCE({agg_sql}(TRY_CAST({m_id} AS DOUBLE)), 0) AS {quoted_alias(m)}')
-
-    select_cols = [f"CAST({dt} AS DATE) AS day"]
-    group_cols = ["day"]
-    if region_col:
-        select_cols.append(f"CAST({rg} AS VARCHAR) AS region")
-        group_cols.append("region")
-
-    where_clauses = [f"CAST({dt} AS DATE) BETWEEN ? AND ?"]
-    params: list = [start_d.date(), end_d.date()]
-
-    mw, mw_params = _meta_where(src, want_meta)
-    where_clauses.append(mw)
-    params.extend(mw_params)
-
-    if region_col and regions_selected:
-        placeholders = ",".join(["?"] * len(regions_selected))
-        where_clauses.append(f"CAST({rg} AS VARCHAR) IN ({placeholders})")
-    params.extend(regions_selected)
-
-    group_by_expr = ", ".join(group_cols)
-    sql = f"""
-        SELECT
-          {", ".join(select_cols)},
-          {", ".join(metric_exprs)}
-        FROM t
-        WHERE {" AND ".join(where_clauses)}
-        GROUP BY {group_by_expr}
-        ORDER BY {group_by_expr}
-    """
-    return con.execute(sql, params).df()
-
-
-def fetch_weekly_aggregates(
-    con: duckdb.DuckDBPyConnection,
-    allowed_cols: list[str],
-    source_col: str,
-    date_col: str,
-    metrics: list[str],
-    region_col: str | None,
-    regions_selected: list[str],
-    agg_fn: str,
-    analysis_start: pd.Timestamp,
-    analysis_end: pd.Timestamp,
-    source_mode: str,
-    exp_start: pd.Timestamp,
-) -> pd.DataFrame:
-    if not metrics:
-        return pd.DataFrame()
-
-    src = safe_ident(source_col, allowed_cols)
-    dt = safe_ident(date_col, allowed_cols)
-    rg = safe_ident(region_col, allowed_cols) if region_col else None
-    agg_sql = "SUM" if agg_fn == "sum" else "AVG"
-
-    metric_exprs = []
-    for m in metrics:
-        m_id = safe_ident(m, allowed_cols)
-        metric_exprs.append(f'COALESCE({agg_sql}(TRY_CAST({m_id} AS DOUBLE)), 0) AS {quoted_alias(m)}')
-
-    select_cols = [
-        "CAST(FLOOR(DATEDIFF('day', ?, CAST({dt} AS DATE)) / 7) AS INTEGER) AS week_index".format(
-            dt=dt
-        )
-    ]
-    group_cols = ["week_index"]
-    if region_col:
-        select_cols.append(f"CAST({rg} AS VARCHAR) AS region")
-        group_cols.append("region")
-
-    where_clauses = [f"CAST({dt} AS DATE) BETWEEN ? AND ?"]
-    params: list = [exp_start.date(), analysis_start.date(), analysis_end.date()]
-
-    meta_clause, meta_params = _meta_mode_where(src, source_mode)
-    where_clauses.append(meta_clause)
-    params.extend(meta_params)
-
-    if region_col and regions_selected:
-        placeholders = ",".join(["?"] * len(regions_selected))
-        where_clauses.append(f"CAST({rg} AS VARCHAR) IN ({placeholders})")
-        params.extend(regions_selected)
-
-    sql = f"""
-        SELECT
-          {", ".join(select_cols)},
-          {", ".join(metric_exprs)}
-        FROM t
-        WHERE {" AND ".join(where_clauses)}
-        GROUP BY {", ".join(group_cols)}
-        ORDER BY {", ".join(group_cols)}
-    """
-    return con.execute(sql, params).df()
-
-
-def fetch_metric_totals(
-    con: duckdb.DuckDBPyConnection,
-    allowed_cols: list[str],
-    source_col: str,
-    date_col: str,
-    metrics: list[str],
-    region_col: str | None,
-    regions_selected: list[str],
-    start_d: pd.Timestamp,
-    end_d: pd.Timestamp,
-    want_meta: bool | None,
-    source_regex: str | None = None,
-    exclude_regex: list[str] | None = None,
-) -> pd.Series:
-    if not metrics:
-        return pd.Series(dtype="float")
-
-    src = safe_ident(source_col, allowed_cols)
-    dt = safe_ident(date_col, allowed_cols)
-    rg = safe_ident(region_col, allowed_cols) if region_col else None
-
-    metric_exprs = []
-    for m in metrics:
-        m_id = safe_ident(m, allowed_cols)
-        metric_exprs.append(f'COALESCE(SUM(TRY_CAST({m_id} AS DOUBLE)), 0) AS {quoted_alias(m)}')
-
-    where_clauses = [f"CAST({dt} AS DATE) BETWEEN ? AND ?"]
-    params: list = [start_d.date(), end_d.date()]
-
-    if source_regex:
-        where_clauses.append(f"regexp_matches(lower({src}), ?)")
-        params.append(source_regex)
-    else:
-        mw, mw_params = _meta_where(src, bool(want_meta))
-        where_clauses.append(mw)
-        params.extend(mw_params)
-    if exclude_regex:
-        for pattern in exclude_regex:
-            where_clauses.append(f"NOT regexp_matches(lower({src}), ?)")
-            params.append(pattern)
-
-    if region_col and regions_selected:
-        placeholders = ",".join(["?"] * len(regions_selected))
-        where_clauses.append(f"CAST({rg} AS VARCHAR) IN ({placeholders})")
-        params.extend(regions_selected)
-
-    sql = f"""
-        SELECT
-          {", ".join(metric_exprs)}
-        FROM t
-        WHERE {" AND ".join(where_clauses)}
-    """
-    row = con.execute(sql, params).df()
-    if row.empty:
-        return pd.Series(dtype="float")
-    return row.iloc[0]
-
-
-def fetch_region_features(
-    con: duckdb.DuckDBPyConnection,
-    allowed_cols: list[str],
-    source_col: str,
-    date_col: str,
-    metrics: list[str],
-    region_col: str,
-    agg_fn: str,
-    start_d: pd.Timestamp,
-    end_d: pd.Timestamp,
-    source_mode: str,
-    regions_selected: list[str],
-) -> pd.DataFrame:
-    if not metrics:
-        return pd.DataFrame()
-
-    src = safe_ident(source_col, allowed_cols)
-    dt = safe_ident(date_col, allowed_cols)
-    rg = safe_ident(region_col, allowed_cols)
-    agg_sql = "SUM" if agg_fn == "sum" else "AVG"
-
-    metric_exprs = []
-    for m in metrics:
-        m_id = safe_ident(m, allowed_cols)
-        metric_exprs.append(f'COALESCE({agg_sql}(TRY_CAST({m_id} AS DOUBLE)), 0) AS {quoted_alias(m)}')
-
-    where_clauses = [f"CAST({dt} AS DATE) BETWEEN ? AND ?"]
-    params: list = [start_d.date(), end_d.date()]
-
-    meta_clause, meta_params = _meta_mode_where(src, source_mode)
-    where_clauses.append(meta_clause)
-    params.extend(meta_params)
-
-    if regions_selected:
-        placeholders = ",".join(["?"] * len(regions_selected))
-        where_clauses.append(f"CAST({rg} AS VARCHAR) IN ({placeholders})")
-        params.extend(regions_selected)
-
-    sql = f"""
-        SELECT
-          CAST({rg} AS VARCHAR) AS region,
-          {", ".join(metric_exprs)}
-        FROM t
-        WHERE {" AND ".join(where_clauses)}
-        GROUP BY region
-        ORDER BY region
-    """
-    return con.execute(sql, params).df()
-
-
-def fetch_region_daily_features(
-    con: duckdb.DuckDBPyConnection,
-    allowed_cols: list[str],
-    source_col: str,
-    date_col: str,
-    metrics: list[str],
-    region_col: str,
-    agg_fn: str,
-    start_d: pd.Timestamp,
-    end_d: pd.Timestamp,
-    source_mode: str,
-    regions_selected: list[str],
-) -> pd.DataFrame:
-    if not metrics:
-        return pd.DataFrame()
-
-    src = safe_ident(source_col, allowed_cols)
-    dt = safe_ident(date_col, allowed_cols)
-    rg = safe_ident(region_col, allowed_cols)
-    agg_sql = "SUM" if agg_fn == "sum" else "AVG"
-
-    metric_exprs = []
-    for m in metrics:
-        m_id = safe_ident(m, allowed_cols)
-        metric_exprs.append(f'COALESCE({agg_sql}(TRY_CAST({m_id} AS DOUBLE)), 0) AS {quoted_alias(m)}')
-
-    where_clauses = [f"CAST({dt} AS DATE) BETWEEN ? AND ?"]
-    params: list = [start_d.date(), end_d.date()]
-
-    meta_clause, meta_params = _meta_mode_where(src, source_mode)
-    where_clauses.append(meta_clause)
-    params.extend(meta_params)
-
-    if regions_selected:
-        placeholders = ",".join(["?"] * len(regions_selected))
-        where_clauses.append(f"CAST({rg} AS VARCHAR) IN ({placeholders})")
-        params.extend(regions_selected)
-
-    sql = f"""
-        SELECT
-          CAST({dt} AS DATE) AS day,
-          CAST({rg} AS VARCHAR) AS region,
-          {", ".join(metric_exprs)}
-        FROM t
-        WHERE {" AND ".join(where_clauses)}
-        GROUP BY day, region
-        ORDER BY day, region
-    """
-    return con.execute(sql, params).df()
-
-
-def build_weekly_summary(
-    df_week: pd.DataFrame,
-    metrics: list[str],
-    region_col: str | None,
-    exp_start: pd.Timestamp,
-    exp_end: pd.Timestamp,
-) -> pd.DataFrame:
-    if df_week.empty or not metrics:
-        return pd.DataFrame()
-
-    week_df = df_week.copy()
-    exp_start = pd.to_datetime(exp_start).normalize()
-    exp_end = pd.to_datetime(exp_end).normalize()
-    if "week_index" in week_df.columns:
-        week_df["week_index"] = pd.to_numeric(week_df["week_index"], errors="coerce").fillna(0).astype(int)
-        week_df["week_start"] = exp_start + pd.to_timedelta(week_df["week_index"] * 7, unit="D")
-    else:
-        week_df["week_start"] = pd.to_datetime(week_df["week_start"])
-        week_df["week_index"] = ((week_df["week_start"] - exp_start).dt.days // 7).astype(int)
-
-    scope_col = "Scope"
-    if "region" in week_df.columns:
-        week_df[scope_col] = week_df["region"].fillna("(missing)")
-    else:
-        week_df[scope_col] = "All"
-
-    metric_cols = [m for m in metrics if m in week_df.columns]
-    if not metric_cols:
-        return pd.DataFrame()
-
-    id_vars = ["week_start", scope_col]
-    if "week_index" in week_df.columns:
-        id_vars.insert(1, "week_index")
-    long_df = week_df.melt(
-        id_vars=id_vars,
-        value_vars=metric_cols,
-        var_name="Metric",
-        value_name="Value",
-    )
-    long_df["Value"] = pd.to_numeric(long_df["Value"], errors="coerce").fillna(0)
-
-    exp_week_count = max(((exp_end - exp_start).days // 7) + 1, 1)
-    if "week_index" in long_df.columns:
-        long_df["week_offset"] = long_df["week_index"].astype(int)
-    else:
-        long_df["week_offset"] = ((long_df["week_start"] - exp_start).dt.days // 7).astype(int)
-    long_df["week_type"] = "Post"
-    long_df.loc[long_df["week_offset"] < 0, "week_type"] = "Baseline"
-    long_df.loc[
-        (long_df["week_offset"] >= 0) & (long_df["week_offset"] <= exp_week_count - 1),
-        "week_type",
-    ] = "Experiment"
-
-    baseline_mask = long_df["week_type"] == "Baseline"
-    experiment_mask = long_df["week_type"] == "Experiment"
-    post_mask = long_df["week_type"] == "Post"
-    long_df.loc[baseline_mask, "week_label"] = "Baseline wk -" + long_df.loc[baseline_mask, "week_offset"].abs().astype(str)
-    long_df.loc[experiment_mask, "week_label"] = "Exp wk " + (long_df.loc[experiment_mask, "week_offset"] + 1).astype(str)
-    post_base = exp_week_count - 1
-    long_df.loc[post_mask, "week_label"] = "Post wk " + (long_df.loc[post_mask, "week_offset"] - post_base).astype(str)
-
-    baseline_ref = (
-        long_df[baseline_mask]
-        .groupby([scope_col, "Metric"])["Value"]
-        .mean()
-        .reset_index(name="Baseline")
-    )
-    long_df = long_df.merge(baseline_ref, on=[scope_col, "Metric"], how="left")
-
-    long_df["Value vs Baseline"] = long_df["Value"].div(long_df["Baseline"])
-    long_df["Value vs Baseline"] = long_df["Value vs Baseline"].replace([float("inf"), -float("inf")], pd.NA)
-    long_df["Diff from Baseline"] = long_df["Value"] - long_df["Baseline"]
-
-    long_df = long_df.sort_values([scope_col, "week_start", "Metric"])
-    return long_df
-
-
-def build_weekly_period_table(
-    week_long: pd.DataFrame,
-    focus_region: str,
-    reference_regions: list[str],
-) -> pd.DataFrame:
-    if week_long.empty:
-        return pd.DataFrame()
-
-    scope_col = "Scope"
-    working = week_long.copy()
-    overall = (
-        working.groupby(["Metric", "week_type", "week_label"], dropna=False)["Value"]
-        .sum()
-        .reset_index()
-    )
-    overall[scope_col] = "All"
-
-    reference_label = "Reference avg"
-    if reference_regions:
-        ref_subset = working[working[scope_col].isin(reference_regions)]
-        if not ref_subset.empty:
-            ref_agg = (
-                ref_subset.groupby(["Metric", "week_type", "week_label"], dropna=False)["Value"]
-                .mean()
-                .reset_index()
-            )
-            ref_agg[scope_col] = reference_label
-            working = working[~working[scope_col].isin(reference_regions)]
-            working = pd.concat([working, ref_agg], ignore_index=True)
-
-    working = pd.concat([working, overall], ignore_index=True)
-
-    baseline_avg = (
-        working[working["week_type"] == "Baseline"]
-        .groupby([scope_col, "Metric"], dropna=False)["Value"]
-        .mean()
-        .reset_index(name="Baseline Avg")
-    )
-    post_avg = (
-        working[working["week_type"] == "Post"]
-        .groupby([scope_col, "Metric"], dropna=False)["Value"]
-        .mean()
-        .reset_index(name="Post Avg")
-    )
-
-    exp_week = (
-        working[working["week_type"] == "Experiment"]
-        .groupby([scope_col, "Metric", "week_label"], dropna=False)["Value"]
-        .sum()
-        .reset_index()
-    )
-    exp_pivot = exp_week.pivot_table(
-        index=[scope_col, "Metric"], columns="week_label", values="Value"
-    ).reset_index()
-
-    table = baseline_avg.merge(exp_pivot, on=[scope_col, "Metric"], how="outer")
-    table = table.merge(post_avg, on=[scope_col, "Metric"], how="outer")
-
-    exp_cols = [c for c in table.columns if c.startswith("Exp wk")]
-    exp_cols = sorted(
-        exp_cols,
-        key=lambda c: int(re.findall(r"\d+", c)[0]) if re.findall(r"\d+", c) else 0,
-    )
-
-    ordered_cols = [scope_col, "Metric"]
-    if "Baseline Avg" in table.columns:
-        ordered_cols.append("Baseline Avg")
-    ordered_cols.extend(exp_cols)
-    if "Post Avg" in table.columns:
-        ordered_cols.append("Post Avg")
-
-    table = table[ordered_cols]
-
-    value_cols = [c for c in table.columns if c not in {scope_col, "Metric"}]
-    value_rows = table.copy()
-    value_rows["Mode"] = "Values"
-
-    index_rows = table.copy()
-    baseline_series = pd.to_numeric(table.get("Baseline Avg"), errors="coerce")
-
-    def _make_index(series: pd.Series, baseline: pd.Series) -> pd.Series:
-        denom = baseline.replace(0, pd.NA)
-        return series.div(denom).mul(100)
-
-    for col in value_cols:
-        if col == "Baseline Avg":
-            index_rows[col] = baseline_series.apply(
-                lambda val: 100 if pd.notna(val) and val != 0 else pd.NA
-            )
-        else:
-            index_rows[col] = _make_index(pd.to_numeric(table[col], errors="coerce"), baseline_series)
-    index_rows["Mode"] = "Index"
-
-    table = pd.concat([value_rows, index_rows], ignore_index=True)
-
-    order_list = ["All"]
-    if focus_region and focus_region != "All":
-        order_list.append(focus_region)
-    if reference_regions:
-        order_list.append("Reference avg")
-    remaining = sorted([s for s in table[scope_col].unique() if s not in order_list])
-    order_list.extend(remaining)
-    scope_rank = {scope: rank for rank, scope in enumerate(order_list)}
-
-    table["scope_rank"] = table[scope_col].map(lambda s: scope_rank.get(s, len(scope_rank)))
-    mode_rank = {"Values": 0, "Index": 1}
-    table["mode_rank"] = table["Mode"].map(lambda m: mode_rank.get(m, 0))
-    table = table.sort_values(["Metric", "scope_rank", "mode_rank"]).reset_index(drop=True)
-    return table.drop(columns=["scope_rank", "mode_rank"])
-
-
-def style_weekly_table(
-    table: pd.DataFrame,
-    focus_region: str,
-    reference_regions: list[str],
-) -> Styler:
-
-    def highlight_scope(row: pd.Series) -> list[str]:
-        scope = row["Scope"]
-        style_parts = []
-        if scope == focus_region:
-            style_parts.append("background-color: #d9f2d9")
-            style_parts.append("border: 2px solid #1b7f3b")
-        elif scope in reference_regions:
-            palette = ["#f8d7da", "#dbe9ff"]
-            borders = ["#b02a37", "#1f4e8c"]
-            idx = reference_regions.index(scope) if scope in reference_regions else 0
-            style_parts.append(f"background-color: {palette[idx % len(palette)]}")
-            style_parts.append(f"border: 2px dashed {borders[idx % len(borders)]}")
-        elif scope == "All":
-            style_parts.append("background-color: #f0f0f0")
-            style_parts.append("border-top: 2px solid #8a8a8a")
-        else:
-            style_parts.append("background-color: #ffffff")
-        style = "; ".join(style_parts)
-        return [style for _ in row]
-
-    def italicize_mode(row: pd.Series) -> list[str]:
-        style = "font-style: italic" if row["Mode"] == "Index" else ""
-        return [style for _ in row]
-
-    fmt = {col: "{:.2f}" for col in table.columns if col not in {"Scope", "Mode"}}
-
-    return (
-        table.style.apply(highlight_scope, axis=1)
-        .apply(italicize_mode, axis=1)
-        .format(fmt)
-        .set_properties(**{"text-align": "center", "font-size": "16px", "font-weight": "600"})
-        .set_table_styles(
-            [
-                {"selector": "thead th", "props": [("text-align", "center"), ("font-size", "16px"), ("font-weight", "700")]},
-                {"selector": "td", "props": [("padding", "8px 10px")]},
-            ]
-        )
-    )
-
-
-def add_weekly_ratio_metrics(week_df: pd.DataFrame) -> list[str]:
-    ratio_specs = [
-        ("Engaged Sessions / Sessions", "Engaged Sessions", "Sessions"),
-        ("New Users / Total Users", "New Users", "Total Users"),
-        ("Active Users / Total Users", "Active Users", "Total Users"),
-        ("Active Users / New Users", "Active Users", "New Users"),
-        ("Items Viewed / Sessions", "Items Viewed", "Sessions"),
-        ("Items Viewed / Total Users", "Items Viewed", "Total Users"),
-        ("Add to Carts / Sessions", "Add to Carts", "Sessions"),
-        ("Total Purchasers / Total Users", "Total Purchasers", "Total Users"),
-        ("Total Purchasers / New Users", "Total Purchasers", "New Users"),
-        ("First Time Purchasers / Total Purchasers", "First Time Purchasers", "Total Purchasers"),
-    ]
-    added: list[str] = []
-    for label, numerator, denominator in ratio_specs:
-        if numerator not in week_df.columns or denominator not in week_df.columns:
-            continue
-        num = pd.to_numeric(week_df[numerator], errors="coerce")
-        den = pd.to_numeric(week_df[denominator], errors="coerce").replace(0, pd.NA)
-        week_df[label] = num.div(den)
-        added.append(label)
-    return added
-
-def make_long(df_wide: pd.DataFrame, metrics: list[str], region_col: str | None, do_minmax: bool) -> pd.DataFrame:
-    if df_wide.empty:
-        return df_wide
-
-    id_vars = ["day"] + (["region"] if region_col and "region" in df_wide.columns else [])
-    keep = id_vars + [m for m in metrics if m in df_wide.columns]
-    d = df_wide[keep].copy()
-
-    long_df = d.melt(id_vars=id_vars, var_name="metric", value_name="value")
-    long_df["value"] = pd.to_numeric(long_df["value"], errors="coerce").fillna(0)
-
-    if "region" in long_df.columns:
-        long_df["series"] = long_df["metric"].astype(str) + " | " + long_df["region"].astype(str)
-    else:
-        long_df["series"] = long_df["metric"].astype(str)
-
-    return minmax_scale_per_series(long_df, "series", "value") if do_minmax else long_df
-
-
-def parse_date_series(series: pd.Series) -> pd.Series:
-    raw = series.copy()
-    numeric = pd.to_numeric(raw, errors="coerce")
-    numeric_non_na = numeric.dropna()
-    if not numeric_non_na.empty:
-        as_int = numeric_non_na.astype("Int64")
-        as_str = as_int.astype(str)
-        if (as_str.str.len() == 8).mean() >= 0.8:
-            parsed = pd.to_datetime(numeric.astype("Int64").astype(str), format="%Y%m%d", errors="coerce")
-            if parsed.notna().sum() > 0:
-                return parsed
-        if (as_str.str.len() == 14).mean() >= 0.8:
-            parsed = pd.to_datetime(numeric.astype("Int64").astype(str), format="%Y%m%d%H%M%S", errors="coerce")
-            if parsed.notna().sum() > 0:
-                return parsed
-        median_val = numeric_non_na.median()
-        if median_val > 1e11:
-            parsed = pd.to_datetime(numeric, unit="ms", errors="coerce")
-            if parsed.notna().sum() > 0:
-                return parsed
-        if median_val > 1e9:
-            parsed = pd.to_datetime(numeric, unit="s", errors="coerce")
-            if parsed.notna().sum() > 0:
-                return parsed
-    return pd.to_datetime(raw.astype(str).str.strip(), errors="coerce")
-
-
-def plot_lines(long_df: pd.DataFrame, title: str, key: str, y_label: str):
-    if long_df is None or long_df.empty:
-        st.warning("No data after filters.")
-        return
-    fig = px.line(long_df, x="day", y="value", color="series", title=title)
-    fig.update_yaxes(title=y_label)
-    fig.update_layout(margin=dict(l=10, r=10, t=45, b=10), legend_title_text="")
-    st.plotly_chart(fig, use_container_width=True, key=key)
-
-
-def corr_scorecard(df_wide: pd.DataFrame, metrics: list[str], target: str, exp_start: pd.Timestamp, exp_end: pd.Timestamp) -> pd.DataFrame:
-    """
-    Pearson correlation of each metric vs target:
-      - Full period (df_wide as provided)
-      - Experiment period (filtered by exp range)
-    """
-    if df_wide is None or df_wide.empty or target not in df_wide.columns:
-        return pd.DataFrame()
-
-    # ensure day is datetime for filtering
-    d = df_wide.copy()
-    d["day"] = pd.to_datetime(d["day"], errors="coerce")
-    d = d.dropna(subset=["day"])
-
-    def _corr_one(df_slice: pd.DataFrame, a: str, b: str):
-        s = df_slice[[a, b]].dropna()
-        if len(s) < 2:
-            return None, 0
-        x = pd.to_numeric(s[a], errors="coerce")
-        y = pd.to_numeric(s[b], errors="coerce")
-        s2 = pd.concat([x, y], axis=1).dropna()
-        if len(s2) < 2:
-            return None, 0
-        if s2.iloc[:, 0].nunique() <= 1 or s2.iloc[:, 1].nunique() <= 1:
-            return None, len(s2)
-        return float(s2.iloc[:, 0].corr(s2.iloc[:, 1])), len(s2)
-
-    # scopes (global + per-region if region column exists)
-    scope_dfs: list[tuple[str, pd.DataFrame]] = [("All", d)]
-    if "region" in d.columns:
-        for region, region_df in d.groupby("region", dropna=False):
-            if region_df.empty:
-                continue
-            label = "(missing)" if region is None else str(region)
-            scope_dfs.append((label, region_df))
-
-    rows: list[dict[str, object]] = []
-    for scope_label, scope_df in scope_dfs:
-        if scope_df.empty:
-            continue
-        d_exp = scope_df[(scope_df["day"] >= exp_start) & (scope_df["day"] <= exp_end)]
-
-        for m in metrics:
-            if m == target or m not in scope_df.columns:
-                continue
-
-            c_full, n_full = _corr_one(scope_df, target, m)
-            c_exp, n_exp = _corr_one(d_exp, target, m)
-
-            rows.append(
-                {
-                    "Scope": scope_label,
-                    "Metric": m,
-                    "Corr (Full)": None if c_full is None else round(c_full, 3),
-                    "N (Full)": n_full,
-                    "Corr (Experiment)": None if c_exp is None else round(c_exp, 3),
-                    "N (Experiment)": n_exp,
-                }
-            )
+def compute_ratio_table(df, ratios, periods, masks):
+    rows = []
+    for metric_name, (num_col, den_col) in ratios.items():
+        row = {'Metric': metric_name}
+        for label, mask in masks.items():
+            for period_label, (start, end) in periods.items():
+                period_df = df[(df['date'] >= start) & (df['date'] <= end) & mask]
+                row[f'{label} {period_label}'] = ratio_value(period_df, num_col, den_col)
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
 
-# ---------------- UI ----------------
-st.title("📊 GA Deep Dive — Meta vs Other (Fast)")
+def compute_sum_table(df, metrics, periods, masks):
+    rows = []
+    for metric_col in metrics:
+        row = {'Metric': metric_col}
+        for label, mask in masks.items():
+            for period_label, (start, end) in periods.items():
+                period_df = df[(df['date'] >= start) & (df['date'] <= end) & mask]
+                row[f'{label} {period_label}'] = period_df[metric_col].sum()
+        rows.append(row)
 
-uploaded = st.sidebar.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
-if not uploaded:
-    st.info("Upload your Excel or CSV file to begin.")
-    st.stop()
+    return pd.DataFrame(rows)
 
-is_csv = _is_csv_file(uploaded)
-sheet = None
-if not is_csv:
-    uploaded.seek(0)
-    xls = pd.ExcelFile(uploaded)
-    uploaded.seek(0)
-    sheet = st.sidebar.selectbox("Sheet", xls.sheet_names, index=0)
-cols = get_columns_header_only(uploaded, sheet)
 
-# Column selectors
-default_source = "Session source" if "Session source" in cols else cols[0]
-default_date = next((c for c in cols if "date" in c.lower() or "day" in c.lower()), cols[0])
+def format_indexed_table(table, segments, periods, value_formatter):
+    if table.empty:
+        return table, table
 
-st.sidebar.subheader("Columns")
-source_col = st.sidebar.selectbox("Source column", cols, index=cols.index(default_source))
-date_col = st.sidebar.selectbox("Date column", cols, index=cols.index(default_date))
-
-# Region (optional)
-region_candidates = ["(No region grouping)"]
-for c in cols:
-    cl = c.lower()
-    if any(k in cl for k in ["region", "state", "city", "country", "dma", "geo"]):
-        region_candidates.append(c)
-region_choice = st.sidebar.selectbox("Region column", region_candidates, index=0)
-region_col = None if region_choice == "(No region grouping)" else region_choice
-
-# Parquet cache + DuckDB view
-with st.sidebar:
-    with st.spinner("Preparing fast cache (Excel/CSV → Parquet)…"):
-        parquet_path = ensure_parquet(uploaded, sheet, date_col)
-
-con = duckdb_connect_view(parquet_path)
-allowed_cols = cols[:]
-
-# Data min/max dates
-dt_sql = safe_ident(date_col, allowed_cols)
-minmax = con.execute(f"SELECT MIN(CAST({dt_sql} AS DATE)) AS min_d, MAX(CAST({dt_sql} AS DATE)) AS max_d FROM t;").df()
-min_d = pd.to_datetime(minmax.loc[0, "min_d"]).date()
-max_d = pd.to_datetime(minmax.loc[0, "max_d"]).date()
-
-# Sidebar global settings
-st.sidebar.subheader("Global settings")
-agg_fn = st.sidebar.selectbox("Aggregation", ["sum", "mean"], index=0)
-
-# Experiment period (sidebar)
-# Experiment period (sidebar)
-st.sidebar.subheader("Experiment period")
-exp_range = st.sidebar.date_input(
-    "Select experiment start/end",
-    value=(min_d, max_d),
-    min_value=min_d,
-    max_value=max_d,
-)
-exp_start = pd.to_datetime(exp_range[0])
-exp_end = pd.to_datetime(exp_range[1])
-
-# Metrics pool (numeric only)
-exclude = {source_col, date_col}
-if region_col:
-    exclude.add(region_col)
-metrics_pool = get_numeric_metrics(con, cols, exclude=exclude)
-if not metrics_pool:
-    st.error("No numeric metric columns found in this sheet.")
-    st.stop()
-
-# Region selection (global)
-regions_selected: list[str] = []
-if region_col:
-    rg_sql = safe_ident(region_col, allowed_cols)
-    regions_df = con.execute(
-        f"""
-        SELECT DISTINCT CAST({rg_sql} AS VARCHAR) AS region
-        FROM t
-        WHERE {rg_sql} IS NOT NULL
-        ORDER BY region
-        """
-    ).df()
-    regions = regions_df["region"].dropna().astype(str).tolist()
-    st.sidebar.subheader("Regions (global filter)")
-    regions_selected = st.sidebar.multiselect(
-        "Select regions (affects charts + correlations)",
-        options=regions,
-        default=regions[:5] if len(regions) > 5 else regions,
-    )
-
-tab_clean, tab_main, tab_compare, tab_knn, tab_weekly = st.tabs(
-    ["Data cleanup", "Meta vs Other", "Comparison", "Region KNN", "Week-by-week"]
-)
-
-with tab_clean:
-    tab_clean.subheader("Data cleanup")
-    tab_clean.caption("Upload GA funnel data, fix the date column, and assign Meta vs Other.")
-    clean_upload = tab_clean.file_uploader(
-        "Upload Excel or CSV for cleanup",
-        type=["xlsx", "xls", "csv"],
-        key="cleanup_upload",
-    )
-    if clean_upload:
-        is_csv_clean = _is_csv_file(clean_upload)
-        sheet_clean = None
-        if not is_csv_clean:
-            clean_upload.seek(0)
-            xls_clean = pd.ExcelFile(clean_upload)
-            clean_upload.seek(0)
-            sheet_clean = tab_clean.selectbox(
-                "Sheet",
-                xls_clean.sheet_names,
-                index=0,
-                key="cleanup_sheet",
-            )
-        skip_rows = tab_clean.number_input(
-            "Skip header/meta rows",
-            min_value=0,
-            max_value=100,
-            value=0,
-            step=1,
-            help="Use this when the file has extra info before the header row.",
-        )
-        clean_upload.seek(0)
-        if is_csv_clean:
-            hdr = pd.read_csv(clean_upload, nrows=0, skiprows=int(skip_rows))
-        else:
-            hdr = pd.read_excel(clean_upload, sheet_name=sheet_clean, nrows=0, engine="openpyxl", skiprows=int(skip_rows))
-        clean_upload.seek(0)
-        cols_clean = list(hdr.columns)
-        date_default = "Date" if "Date" in cols_clean else cols_clean[0]
-        source_default = "Session source" if "Session source" in cols_clean else cols_clean[0]
-
-        c1, c2 = tab_clean.columns([1, 1], gap="large")
-        date_col_clean = c1.selectbox("Date column", cols_clean, index=cols_clean.index(date_default))
-        source_col_clean = c2.selectbox("Source column", cols_clean, index=cols_clean.index(source_default))
-
-        meta_pattern_input = tab_clean.text_input(
-            "META pattern",
-            value=META_PATTERN,
-            help="Regex used to classify Meta vs Other.",
-            key="cleanup_meta_pattern",
-        )
-        run_cleanup = tab_clean.button("Generate cleaned data", use_container_width=True, key="cleanup_run")
-
-        if run_cleanup:
-            clean_upload.seek(0)
-            if is_csv_clean:
-                df_clean = pd.read_csv(clean_upload, skiprows=int(skip_rows))
+    formatted = table.copy()
+    index_values = pd.DataFrame(np.nan, index=table.index, columns=table.columns)
+    for segment in segments:
+        pre_col = f'{segment} Pre'
+        if pre_col not in formatted.columns:
+            continue
+        pre_vals = formatted[pre_col]
+        for period in periods:
+            col = f'{segment} {period}'
+            if col not in formatted.columns:
+                continue
+            values = formatted[col]
+            if period == 'Pre':
+                idx_vals = np.where(pre_vals.notna() & (pre_vals != 0), 100.0, np.nan)
             else:
-                df_clean = pd.read_excel(
-                    clean_upload, sheet_name=sheet_clean, engine="openpyxl", skiprows=int(skip_rows)
+                idx_vals = np.where(pre_vals.notna() & (pre_vals != 0), (values / pre_vals) * 100, np.nan)
+
+            index_values[col] = idx_vals
+            formatted[col] = [
+                format_value(val, idx_val, value_formatter)
+                for val, idx_val in zip(values, idx_vals)
+            ]
+
+    return formatted, index_values
+
+
+def build_index_styles(index_values, highlight_periods):
+    styles = pd.DataFrame('', index=index_values.index, columns=index_values.columns)
+    for period in highlight_periods:
+        suffix = f' {period}'
+        for col in index_values.columns:
+            if not col.endswith(suffix):
+                continue
+            idx_vals = index_values[col]
+            styles[col] = np.where(
+                idx_vals.isna(),
+                '',
+                np.where(
+                    idx_vals > 100,
+                    'background-color: #d4edda; color: #155724;',
+                    'background-color: #f8d7da; color: #721c24;'
                 )
-            clean_upload.seek(0)
-            df_clean.columns = [str(c).strip() for c in df_clean.columns]
-
-            parsed_date = parse_date_series(df_clean[date_col_clean])
-            df_clean[date_col_clean] = parsed_date.dt.tz_localize(None).dt.normalize()
-            meta_pattern = meta_pattern_input or META_PATTERN
-            meta_mask = df_clean[source_col_clean].astype(str).str.contains(meta_pattern, case=False, na=False, regex=True)
-            df_clean["Source Type"] = meta_mask.map(lambda v: "Meta" if v else "Other")
-            df_clean["Is Meta"] = meta_mask
-
-            if df_clean[date_col_clean].isna().any():
-                tab_clean.warning("Some rows could not be converted to dates. Review the preview below.")
-
-            tab_clean.subheader("Preview (first 50 rows)")
-            tab_clean.dataframe(df_clean.head(50), use_container_width=True)
-
-            out_name = tab_clean.text_input(
-                "Output file name",
-                value="ga_funnel_cleaned.csv",
-                key="cleanup_out_name",
             )
-            out_name = out_name.strip() or "ga_funnel_cleaned.csv"
-            csv_bytes = df_clean.to_csv(index=False).encode("utf-8")
-            tab_clean.download_button(
-                label="Download cleaned CSV",
-                data=csv_bytes,
-                file_name=out_name,
-                mime="text/csv",
-            )
+    return styles
+
+
+def format_value(val, idx, value_formatter):
+    if pd.isna(val):
+        return ''
+    val_str = value_formatter(val)
+    if pd.isna(idx):
+        return f'{val_str} (-)'
+    return f'{val_str} ({idx:,.0f})'
+
+
+def format_ratio(val):
+    return f'{val:.4f}'
+
+
+def format_raw(val):
+    if pd.isna(val):
+        return ''
+    if abs(val - round(val)) < 1e-6:
+        return f'{val:,.0f}'
+    return f'{val:,.2f}'
+
+
+def metric_key(name):
+    return (
+        'metric_'
+        + name.lower()
+        .replace(' ', '_')
+        .replace('/', '_')
+        .replace('-', '_')
+    )
+
+
+def clamp_range(start, end, min_date, max_date):
+    start = max(start, min_date)
+    end = min(end, max_date)
+    if end < start:
+        end = start
+    return start, end
+
+
+def key(prefix, name):
+    return f'{prefix}_{name}'
+
+
+st.title('Campaign vs Pre-Campaign Comparison')
+
+tabs_main = st.tabs(['Generic dataset', 'Shopify + Meta'])
+with tabs_main[0]:
+    st.subheader('Controls')
+    row1 = st.columns([2.2, 2.2, 1.0, 1.1, 1.1, 1.1])
+
+    with row1[0]:
+        upload = st.file_uploader(
+            'Upload data file',
+            type=['csv', 'xlsx', 'xls'],
+            key=key('gen', 'upload')
+        )
+    with row1[1]:
+        if upload is None:
+            data_path = st.text_input('Data file path', str(DEFAULT_DATA), key=key('gen', 'path'))
         else:
-            tab_clean.info("Click Generate cleaned data to preview and download the cleaned file.")
+            data_path = ''
+            st.caption('Using uploaded file')
 
-with tab_main:
-    # Graph state
-    if "graph_count" not in st.session_state:
-        st.session_state.graph_count = 1
-    if "graph_dates" not in st.session_state:
-        st.session_state.graph_dates = {}
-    if "graph_metrics" not in st.session_state:
-        st.session_state.graph_metrics = {}
-    if "graph_minmax" not in st.session_state:
-        st.session_state.graph_minmax = {}
-    if "graph_corr_target" not in st.session_state:
-        st.session_state.graph_corr_target = {}
+    upload_bytes = None
+    upload_name = None
+    upload_ext = None
+    if upload is not None:
+        upload_bytes = upload.getvalue()
+        upload_name = upload.name
+        upload_ext = Path(upload_name).suffix.lower()
 
-    # Render graphs
-    for i in range(st.session_state.graph_count):
-        st.divider()
-        st.subheader(f"📈 Graph {i+1}")
+    sheet_name = ''
+    if upload_bytes and upload_ext in ['.xlsx', '.xls']:
+        sheet_names = list_sheets_from_upload(upload_bytes)
+        if sheet_names:
+            with row1[2]:
+                sheet_name = st.selectbox('Sheet', sheet_names, key=key('gen', 'sheet_select'))
+        else:
+            with row1[2]:
+                sheet_name = st.text_input('Sheet (Excel only)', value='', key=key('gen', 'sheet_text'))
+    else:
+        with row1[2]:
+            sheet_name = st.text_input('Sheet (Excel only)', value='', key=key('gen', 'sheet_text'))
 
-        # controls in ONE ROW (columns): date | y-metrics | minmax+corrTarget
-        c_date, c_metrics, c_opts = st.columns([1.2, 2.8, 1.4], gap="small")
-
-        # per-graph defaults
-        if i not in st.session_state.graph_dates:
-            st.session_state.graph_dates[i] = (min_d, max_d)
-        if i not in st.session_state.graph_metrics:
-            st.session_state.graph_metrics[i] = metrics_pool[:2] if len(metrics_pool) >= 2 else metrics_pool[:1]
-        if i not in st.session_state.graph_minmax:
-            st.session_state.graph_minmax[i] = True
-
-        g_date = c_date.date_input(
-            "Date range",
-            value=st.session_state.graph_dates[i],
-            min_value=min_d,
-            max_value=max_d,
-            key=f"date_{i}",
-        )
-        st.session_state.graph_dates[i] = g_date
-        g_start = pd.to_datetime(g_date[0])
-        g_end = pd.to_datetime(g_date[1])
-
-        metrics_sel = c_metrics.multiselect(
-            "Y-metrics (lines)",
-            options=metrics_pool,
-            default=st.session_state.graph_metrics[i],
-            key=f"metrics_{i}",
-        )
-        st.session_state.graph_metrics[i] = metrics_sel
-
-        do_minmax = c_opts.checkbox(
-            "Min–Max (0–1)",
-            value=st.session_state.graph_minmax[i],
-            key=f"minmax_{i}",
-            help="ON: each line scaled 0–1. OFF: raw values.",
-        )
-        st.session_state.graph_minmax[i] = do_minmax
-
-        corr_target_options = metrics_sel[:] if metrics_sel else metrics_pool
-        default_target = corr_target_options[0] if corr_target_options else None
-        if i not in st.session_state.graph_corr_target:
-            st.session_state.graph_corr_target[i] = default_target
-
-        corr_target = c_opts.selectbox(
-            "Corr target",
-            options=corr_target_options if corr_target_options else ["(none)"],
-            index=0,
-            key=f"corr_target_{i}",
-            help="Correlations shown below each chart: each metric vs this target.",
-        )
-        st.session_state.graph_corr_target[i] = corr_target
-
-        # plots
-        left, right = st.columns(2, gap="large")
-
-        # META side
-        df_meta_wide_plot = fetch_agg_for_plot(
-            con, allowed_cols, source_col, date_col,
-            metrics_sel, region_col, regions_selected,
-            agg_fn, g_start, g_end, want_meta=True
-        )
-        meta_long = make_long(df_meta_wide_plot, metrics_sel, region_col, do_minmax)
-
-        with left:
-            st.markdown("### 🟦 Meta Sources")
-            plot_lines(
-                meta_long,
-                title="Meta",
-                key=f"meta_plot_{i}",
-                y_label="Scaled (0–1)" if do_minmax else "Value",
-            )
-
-            # correlation scorecard for META (day-only)
-            df_meta_corr = fetch_agg_day_only_for_corr(
-                con, allowed_cols, source_col, date_col,
-                metrics_sel, region_col, regions_selected,
-                agg_fn, g_start, g_end, want_meta=True
-            )
-            corr_tbl = corr_scorecard(df_meta_corr, metrics_sel, corr_target, exp_start, exp_end)
-            st.caption(f"Pearson correlation vs **{corr_target}** (Full vs Experiment)")
-            if corr_tbl.empty:
-                st.info("Not enough data / select at least 2 metrics to show correlations.")
-            else:
-                st.dataframe(corr_tbl, use_container_width=True, hide_index=True)
-
-        # OTHER side
-        df_other_wide_plot = fetch_agg_for_plot(
-            con, allowed_cols, source_col, date_col,
-            metrics_sel, region_col, regions_selected,
-            agg_fn, g_start, g_end, want_meta=False
-        )
-        other_long = make_long(df_other_wide_plot, metrics_sel, region_col, do_minmax)
-
-        with right:
-            st.markdown("### 🟩 Other Sources")
-            plot_lines(
-                other_long,
-                title="Other",
-                key=f"other_plot_{i}",
-                y_label="Scaled (0–1)" if do_minmax else "Value",
-            )
-
-            df_other_corr = fetch_agg_day_only_for_corr(
-                con, allowed_cols, source_col, date_col,
-                metrics_sel, region_col, regions_selected,
-                agg_fn, g_start, g_end, want_meta=False
-            )
-            corr_tbl2 = corr_scorecard(df_other_corr, metrics_sel, corr_target, exp_start, exp_end)
-            st.caption(f"Pearson correlation vs **{corr_target}** (Full vs Experiment)")
-            if corr_tbl2.empty:
-                st.info("Not enough data / select at least 2 metrics to show correlations.")
-            else:
-                st.dataframe(corr_tbl2, use_container_width=True, hide_index=True)
-
-        # Add/Remove buttons ALWAYS below the LAST graph
-        if i == st.session_state.graph_count - 1:
-            b1, b2, _ = st.columns([1, 1, 6])
-            if b1.button("+ Add Graph Below", use_container_width=True, key=f"add_{i}"):
-                st.session_state.graph_count += 1
-                st.rerun()
-            if b2.button("− Remove Last", use_container_width=True, key=f"rem_{i}") and st.session_state.graph_count > 1:
-                last = st.session_state.graph_count - 1
-                st.session_state.graph_dates.pop(last, None)
-                st.session_state.graph_metrics.pop(last, None)
-                st.session_state.graph_minmax.pop(last, None)
-                st.session_state.graph_corr_target.pop(last, None)
-                st.session_state.graph_count -= 1
-                st.rerun()
-
-    with st.expander("Preview (first 50 rows)"):
-        preview = con.execute("SELECT * FROM t LIMIT 50;").df()
-        st.dataframe(preview, use_container_width=True)
-
-with tab_compare:
-    tab_compare.subheader("Meta vs Other comparison (daily totals)")
-    tab_compare.caption("Build ratio tables from daily totals over a selected date range.")
-
-    ratio_specs = [
-        ("Engaged Sessions / Sessions", "Engaged Sessions", "Sessions"),
-        ("New Users / Total Users", "New Users", "Total Users"),
-        ("Active Users / Total Users", "Active Users", "Total Users"),
-        ("Active Users / New Users", "Active Users", "New Users"),
-        ("Items Viewed / Sessions", "Items Viewed", "Sessions"),
-        ("Items Viewed / Total Users", "Items Viewed", "Total Users"),
-        ("Add to Carts / Sessions", "Add to Carts", "Sessions"),
-        ("Total Purchasers / Total Users", "Total Purchasers", "Total Users"),
-        ("Total Purchasers / New Users", "Total Purchasers", "New Users"),
-        ("First Time Purchasers / Total Purchasers", "First Time Purchasers", "Total Purchasers"),
-    ]
-    col_lookup = {c.lower(): c for c in allowed_cols}
-    filtered_specs = []
-    for label, numerator, denominator in ratio_specs:
-        num_key = numerator.lower()
-        den_key = denominator.lower()
-        if num_key in col_lookup and den_key in col_lookup:
-            filtered_specs.append((label, col_lookup[num_key], col_lookup[den_key]))
-    ratio_specs = filtered_specs
-    ratio_names = [r[0] for r in ratio_specs]
-    ratio_map = {r[0]: (r[1], r[2]) for r in ratio_specs}
-
-    if not ratio_specs:
-        tab_compare.warning("No ratio inputs available in this file. Check column names.")
+    try:
+        if upload_bytes:
+            df = load_data_bytes(upload_bytes, upload_name, sheet_name.strip() or None)
+        else:
+            df = load_data_path(data_path, sheet_name.strip() or None)
+    except Exception as exc:
+        st.error(f'Failed to load data file: {exc}')
         st.stop()
 
-    if "compare_count" not in st.session_state:
-        st.session_state.compare_count = 1
-    if "compare_dates" not in st.session_state:
-        st.session_state.compare_dates = {}
-    if "compare_ratios" not in st.session_state:
-        st.session_state.compare_ratios = {}
-    if "compare_regions" not in st.session_state:
-        st.session_state.compare_regions = {}
+    if df.empty:
+        st.error('Loaded data is empty.')
+        st.stop()
 
-    for i in range(st.session_state.compare_count):
-        tab_compare.divider()
-        tab_compare.subheader(f"Comparison {i+1}")
+    candidate_dates = find_date_candidates(df)
+    if not candidate_dates:
+        st.error('No date-like columns found. Rename the date column to include date/day or select a different file.')
+        st.stop()
 
-        c_left, c_right = tab_compare.columns([1.2, 1.8], gap="large")
-        if i not in st.session_state.compare_dates:
-            st.session_state.compare_dates[i] = (min_d, max_d)
+    with row1[3]:
+        date_col = st.selectbox('Date column', candidate_dates, index=0, key=key('gen', 'date_col'))
 
-        cmp_dates = c_left.date_input(
-            "Date range",
-            value=st.session_state.compare_dates[i],
-            min_value=min_d,
-            max_value=max_d,
-            key=f"cmp_dates_{i}",
+    non_numeric_cols = [
+        c for c in df.columns
+        if c != date_col and not pd.api.types.is_numeric_dtype(df[c])
+    ]
+    non_numeric_cols = sorted(non_numeric_cols)
+
+    source_options = ['(none)'] + non_numeric_cols
+    region_options = ['(none)'] + non_numeric_cols
+
+    source_default = source_options.index('Session source') if 'Session source' in source_options else 0
+    region_default = region_options.index('Region_y') if 'Region_y' in region_options else 0
+
+    with row1[4]:
+        source_col = st.selectbox('Source column', source_options, index=source_default, key=key('gen', 'source_col'))
+    with row1[5]:
+        region_col = st.selectbox('Region column', region_options, index=region_default, key=key('gen', 'region_col'))
+
+    working_df = df.copy()
+    working_df['date'] = normalize_date(working_df[date_col])
+    working_df = working_df[working_df['date'].notna()].copy()
+
+    if working_df.empty:
+        st.error('No usable dates found after parsing the date column.')
+        st.stop()
+
+    min_date = working_df['date'].min()
+    max_date = working_df['date'].max()
+
+    campaign_length = 30
+    campaign_start_default = max_date - timedelta(days=campaign_length - 1)
+    campaign_end_default = max_date
+    pre_end_default = campaign_start_default - timedelta(days=1)
+    pre_start_default = pre_end_default - timedelta(days=campaign_length - 1)
+    post_start_default = campaign_end_default + timedelta(days=1)
+    post_end_default = post_start_default + timedelta(days=campaign_length - 1)
+
+    pre_start_default, pre_end_default = clamp_range(pre_start_default, pre_end_default, min_date, max_date)
+    campaign_start_default, campaign_end_default = clamp_range(
+        campaign_start_default, campaign_end_default, min_date, max_date
+    )
+    post_start_default, post_end_default = clamp_range(post_start_default, post_end_default, min_date, max_date)
+
+    row2 = st.columns(6)
+    with row2[0]:
+        pre_start = st.date_input('Pre start', value=pre_start_default.date(), key=key('gen', 'pre_start'))
+    with row2[1]:
+        pre_end = st.date_input('Pre end', value=pre_end_default.date(), key=key('gen', 'pre_end'))
+    with row2[2]:
+        campaign_start = st.date_input(
+            'Campaign start', value=campaign_start_default.date(), key=key('gen', 'campaign_start')
         )
-        st.session_state.compare_dates[i] = cmp_dates
-        cmp_start = pd.to_datetime(cmp_dates[0])
-        cmp_end = pd.to_datetime(cmp_dates[1])
-
-        if region_col:
-            default_regions = st.session_state.compare_regions.get(i, regions[:])
-            default_regions = [r for r in default_regions if r in regions]
-            if not default_regions:
-                default_regions = regions[:]
-            cmp_regions = c_left.multiselect(
-                "Regions",
-                options=regions,
-                default=default_regions,
-                key=f"cmp_regions_{i}",
-            )
-            st.session_state.compare_regions[i] = cmp_regions
-        else:
-            cmp_regions = []
-            c_left.caption("No region column selected; using all regions.")
-
-        default_ratios = st.session_state.compare_ratios.get(i, ratio_names[:])
-        default_ratios = [r for r in default_ratios if r in ratio_names]
-        if not default_ratios:
-            default_ratios = ratio_names[:]
-        cmp_ratios = c_right.multiselect(
-            "Ratios to include",
-            options=ratio_names,
-            default=default_ratios,
-            key=f"cmp_ratios_{i}",
+    with row2[3]:
+        campaign_end = st.date_input(
+            'Campaign end', value=campaign_end_default.date(), key=key('gen', 'campaign_end')
         )
-        st.session_state.compare_ratios[i] = cmp_ratios
+    with row2[4]:
+        post_start = st.date_input('Post start', value=post_start_default.date(), key=key('gen', 'post_start'))
+    with row2[5]:
+        post_end = st.date_input('Post end', value=post_end_default.date(), key=key('gen', 'post_end'))
 
-        if not cmp_ratios:
-            tab_compare.info("Select at least one ratio to build the comparison table.")
+    pre_start = pd.Timestamp(pre_start)
+    pre_end = pd.Timestamp(pre_end)
+    campaign_start = pd.Timestamp(campaign_start)
+    campaign_end = pd.Timestamp(campaign_end)
+    post_start = pd.Timestamp(post_start)
+    post_end = pd.Timestamp(post_end)
+
+    if pre_end < pre_start or campaign_end < campaign_start or post_end < post_start:
+        st.error('Each period must have an end date on or after its start date.')
+        st.stop()
+
+    st.caption(f'Data range: {min_date.date()} to {max_date.date()}')
+
+    if pre_start < min_date or pre_end > max_date:
+        st.warning('Pre period is outside the available date range.')
+    if campaign_start < min_date or campaign_end > max_date:
+        st.warning('Campaign period is outside the available date range.')
+    if post_start < min_date or post_end > max_date:
+        st.warning('Post period is outside the available date range.')
+
+    periods = {
+        'Pre': (pre_start, pre_end),
+        'Campaign': (campaign_start, campaign_end),
+        'Post': (post_start, post_end),
+    }
+
+    with st.expander('Filters', expanded=True):
+        if region_col != '(none)':
+            region_values = sorted([v for v in working_df[region_col].dropna().unique()])
+            default_focus = ['West'] if 'West' in region_values else region_values[:1]
+            focus_regions = st.multiselect(
+                'Focus region values',
+                region_values,
+                default=default_focus,
+                key=key('gen', 'focus_regions')
+            )
+            include_unknown_region = st.checkbox(
+                'Include unknown region in All Other',
+                value=True,
+                key=key('gen', 'include_unknown_region')
+            )
         else:
-            needed_cols = sorted({col for name in cmp_ratios for col in ratio_map[name]})
-            meta_totals = fetch_metric_totals(
-                con,
-                allowed_cols,
-                source_col,
-                date_col,
-                needed_cols,
-                region_col,
-                cmp_regions,
-                cmp_start,
-                cmp_end,
-                want_meta=True,
-            )
-            google_totals = fetch_metric_totals(
-                con,
-                allowed_cols,
-                source_col,
-                date_col,
-                needed_cols,
-                region_col,
-                cmp_regions,
-                cmp_start,
-                cmp_end,
-                want_meta=None,
-                source_regex="goog",
-            )
-            non_meta_non_google_totals = fetch_metric_totals(
-                con,
-                allowed_cols,
-                source_col,
-                date_col,
-                needed_cols,
-                region_col,
-                cmp_regions,
-                cmp_start,
-                cmp_end,
-                want_meta=False,
-                exclude_regex=["goog"],
-            )
-            other_totals = fetch_metric_totals(
-                con,
-                allowed_cols,
-                source_col,
-                date_col,
-                needed_cols,
-                region_col,
-                cmp_regions,
-                cmp_start,
-                cmp_end,
-                want_meta=False,
-            )
+            focus_regions = []
+            include_unknown_region = True
+            st.info('Select a region column to enable region filtering.')
 
-            rows = []
-            for ratio_name in cmp_ratios:
-                num_col, den_col = ratio_map[ratio_name]
-                meta_den = meta_totals.get(den_col, pd.NA)
-                google_den = google_totals.get(den_col, pd.NA)
-                non_meta_non_google_den = non_meta_non_google_totals.get(den_col, pd.NA)
-                other_den = other_totals.get(den_col, pd.NA)
-                meta_val = (
-                    (meta_totals.get(num_col, pd.NA) / meta_den)
-                    if pd.notna(meta_den) and meta_den != 0
-                    else pd.NA
-                )
-                google_val = (
-                    (google_totals.get(num_col, pd.NA) / google_den)
-                    if pd.notna(google_den) and google_den != 0
-                    else pd.NA
-                )
-                non_meta_non_google_val = (
-                    (non_meta_non_google_totals.get(num_col, pd.NA) / non_meta_non_google_den)
-                    if pd.notna(non_meta_non_google_den) and non_meta_non_google_den != 0
-                    else pd.NA
-                )
-                other_val = (
-                    (other_totals.get(num_col, pd.NA) / other_den)
-                    if pd.notna(other_den) and other_den != 0
-                    else pd.NA
-                )
-                rows.append(
-                    {
-                        "Ratio": ratio_name,
-                        "Meta": meta_val,
-                        "Google": google_val,
-                        "Non-Meta Non-Google": non_meta_non_google_val,
-                        "Other": other_val,
-                    }
-                )
-
-            table = pd.DataFrame(rows)
-            styled = (
-                table.style.format(
-                    {
-                        "Meta": "{:.2f}",
-                        "Google": "{:.2f}",
-                        "Non-Meta Non-Google": "{:.2f}",
-                        "Other": "{:.2f}",
-                    }
-                )
-                .set_properties(**{"text-align": "center", "font-size": "16px", "font-weight": "600"})
-                .set_table_styles(
-                    [
-                        {"selector": "thead th", "props": [("text-align", "center"), ("font-size", "16px"), ("font-weight", "700")]},
-                        {"selector": "td", "props": [("padding", "8px 10px")]},
-                    ]
-                )
+        if source_col != '(none)':
+            default_pattern = r'fb|fbig|facebook|meta|insta'
+            meta_pattern = st.text_input(
+                'Meta source pattern (regex)',
+                value=default_pattern,
+                key=key('gen', 'meta_pattern')
             )
-            tab_compare.dataframe(styled, use_container_width=True)
+            include_unknown_source = st.checkbox(
+                'Include unknown source in Non-Meta',
+                value=True,
+                key=key('gen', 'include_unknown_source')
+            )
+        else:
+            meta_pattern = ''
+            include_unknown_source = True
+            st.warning('Select a source column to enable Meta vs Non-Meta segmentation.')
 
-        if i == st.session_state.compare_count - 1:
-            b1, b2, _ = tab_compare.columns([1, 1, 6])
-            if b1.button("+ Add Comparison Below", use_container_width=True, key=f"cmp_add_{i}"):
-                st.session_state.compare_count += 1
-                st.rerun()
-            if b2.button("Remove Last", use_container_width=True, key=f"cmp_rem_{i}") and st.session_state.compare_count > 1:
-                last = st.session_state.compare_count - 1
-                st.session_state.compare_dates.pop(last, None)
-                st.session_state.compare_ratios.pop(last, None)
-                st.session_state.compare_regions.pop(last, None)
-                st.session_state.compare_count -= 1
-                st.rerun()
+    numeric_cols = [c for c in working_df.select_dtypes(include='number').columns if c != 'date']
 
-with tab_weekly:
-    tab_weekly.subheader("Week-by-week experiment view")
-    tab_weekly.caption("Use the controls below to compare each week stitched to your experiment window.")
-    controls_left, controls_right = tab_weekly.columns([1, 1], gap="large")
-    baseline_weeks = controls_left.slider(
-        "Baseline weeks before experiment",
-        0,
-        8,
-        4,
-        help="Include this many full weeks before the experiment to build the baseline index.",
-    )
-    post_weeks = controls_left.slider(
-        "Weeks after experiment",
-        0,
-        4,
-        1,
-        help="Include these weeks after the experiment end if data is available.",
-    )
-    source_mode_label = controls_right.selectbox(
-        "Source focus",
-        ["Meta", "Other", "All"],
-        index=0,
-    )
-    week_metrics_default = metrics_pool[:2] if len(metrics_pool) >= 2 else metrics_pool
-    week_metrics = controls_right.multiselect(
-        "Metrics to summarize weekly",
-        options=metrics_pool,
-        default=st.session_state.get("week_metrics_weekly", week_metrics_default),
-        key="week_metrics_weekly",
-    )
+    ratio_candidates = [
+        ('Engaged Sessions / Sessions', 'Engaged sessions', 'Sessions'),
+        ('New Users / Total Users', 'New users', 'Total users'),
+        ('Items Viewed / Total Users', 'Items viewed', 'Total users'),
+        ('Add to Carts / Sessions', 'Add to carts', 'Sessions'),
+        ('Total Purchasers / Total Users', 'Total purchasers', 'Total users'),
+    ]
 
-    if not week_metrics:
-        tab_weekly.info("Select at least one metric to generate the weekly summary.")
+    ratio_defs = {
+        name: (num, den)
+        for name, num, den in ratio_candidates
+        if num in working_df.columns and den in working_df.columns
+    }
+
+    custom_ratios_key = key('gen', 'custom_ratios')
+    selected_metrics_key = key('gen', 'selected_metrics')
+    metric_mode_key = key('gen', 'metric_mode')
+    metric_mode_prev_key = key('gen', 'metric_mode_prev')
+
+    if custom_ratios_key not in st.session_state:
+        st.session_state[custom_ratios_key] = {}
+
+    ratio_defs.update(st.session_state[custom_ratios_key])
+
+    if selected_metrics_key not in st.session_state:
+        st.session_state[selected_metrics_key] = list(ratio_defs.keys())
     else:
-        analysis_start = exp_start - pd.Timedelta(weeks=baseline_weeks)
-        analysis_end = exp_end + pd.Timedelta(weeks=post_weeks)
-        exp_weeks = max(((exp_end - exp_start).days // 7) + 1, 1)
-        regions_label = ", ".join(regions_selected) if regions_selected else "All regions"
-        context_lines = [
-            f"Source focus {source_mode_label}. Aggregating {baseline_weeks} baseline, {exp_weeks} experiment, and {post_weeks} post week(s) covering {analysis_start.date()} to {analysis_end.date()}.",
-            "Weekly table uses weekly sums; baseline/post are averages of those weekly sums.",
-            f"Regions filter: {regions_label}.",
+        st.session_state[selected_metrics_key] = [
+            m for m in st.session_state[selected_metrics_key] if m in ratio_defs
         ]
-        context_block = "<br>".join(context_lines)
-        mode_map = {"Meta": "meta", "Other": "other", "All": "all"}
-        source_mode = mode_map.get(source_mode_label, "meta")
-        week_df = fetch_weekly_aggregates(
-            con, allowed_cols, source_col, date_col,
-            week_metrics, region_col, regions_selected,
-            "sum", analysis_start, analysis_end, source_mode, exp_start
-        )
-        ratio_metrics = add_weekly_ratio_metrics(week_df)
-        week_long = build_weekly_summary(week_df, week_metrics, region_col, exp_start, exp_end)
-        if week_long.empty:
-            tab_weekly.warning("No weekly data is available for the selected filters.")
-        else:
-            scope_options = sorted(week_long["Scope"].unique())
-            if not scope_options:
-                tab_weekly.warning("No region/week scopes were generated.")
-            else:
-                focus_key = "weekly_focus_region"
-                if focus_key not in st.session_state or st.session_state[focus_key] not in scope_options:
-                    st.session_state[focus_key] = scope_options[0]
-                focus_region = controls_right.selectbox(
-                    "Focus region for indexing",
-                    options=scope_options,
-                    key=focus_key,
-                    index=scope_options.index(st.session_state[focus_key]),
-                )
-                available_references = [s for s in scope_options if s != focus_region]
-                ref_key = "weekly_reference_regions"
-                if ref_key not in st.session_state:
-                    st.session_state[ref_key] = []
-                default_refs = [r for r in st.session_state[ref_key] if r in available_references]
-                if not default_refs:
-                    default_refs = available_references[:2]
-                reference_regions = controls_right.multiselect(
-                    "Reference regions",
-                    options=available_references,
-                    default=default_refs,
-                    key=ref_key,
-                )
-                include_all_key = "weekly_include_all_scopes"
-                include_all_scopes = controls_left.checkbox(
-                    "Include all filtered regions",
-                    value=st.session_state.get(include_all_key, False),
-                    key=include_all_key,
-                )
-                with controls_left.expander("Weekly table context", expanded=True):
-                    st.markdown(context_block, unsafe_allow_html=True)
-                table = build_weekly_period_table(week_long, focus_region, reference_regions)
-                if table.empty:
-                    tab_weekly.warning("Unable to summarize the weekly periods for the chosen filters.")
-                else:
-                    focus_line = f"Focus={focus_region}; reference set={', '.join(reference_regions) or 'none'}."
-                    with controls_right.expander("Selected focus & references", expanded=True):
-                        st.markdown(focus_line)
-                    reference_display = ["Reference avg"] if reference_regions else []
-                    if not include_all_scopes:
-                        allowed = {focus_region, *reference_display, "All"}
-                        table = table[table["Scope"].isin(allowed)]
-                    metric_names = [m for m in week_metrics if m in table["Metric"].unique()]
-                    metric_tabs = tab_weekly.tabs(metric_names)
-                    for metric, metric_tab in zip(metric_names, metric_tabs):
-                        metric_table = table[table["Metric"] == metric].drop(columns=["Metric"])
-                        with metric_tab:
-                            styled = style_weekly_table(metric_table, focus_region, reference_display)
-                            st.dataframe(styled, use_container_width=True)
 
-                    if ratio_metrics:
-                        ratio_long = build_weekly_summary(
-                            week_df, ratio_metrics, region_col, exp_start, exp_end
-                        )
-                        ratio_table = build_weekly_period_table(
-                            ratio_long, focus_region, reference_regions
-                        )
-                        if not ratio_table.empty:
-                            tab_weekly.divider()
-                            tab_weekly.subheader("Computed ratios (post-week aggregation)")
-                            if not include_all_scopes:
-                                allowed = {focus_region, *reference_display, "All"}
-                                ratio_table = ratio_table[ratio_table["Scope"].isin(allowed)]
-                            ratio_names = [m for m in ratio_metrics if m in ratio_table["Metric"].unique()]
-                            ratio_tabs = tab_weekly.tabs(ratio_names)
-                            for metric, ratio_tab in zip(ratio_names, ratio_tabs):
-                                metric_table = ratio_table[ratio_table["Metric"] == metric].drop(columns=["Metric"])
-                                with ratio_tab:
-                                    styled = style_weekly_table(
-                                        metric_table, focus_region, reference_display
-                                    )
-                                    st.dataframe(styled, use_container_width=True)
+    st.subheader('Metrics')
+    metric_mode = st.radio(
+        'Metrics selection mode',
+        ['Multiselect', 'Checklist'],
+        horizontal=True,
+        key=metric_mode_key,
+    )
 
-with tab_knn:
-    tab_knn.subheader("Region similarity (KNN)")
-    tab_knn.caption("Select metrics and a focus region to find the closest regions.")
-    if not region_col:
-        tab_knn.info("Select a Region column in the sidebar to enable region clustering.")
+    metric_keys = {name: metric_key(name) for name in ratio_defs}
+
+    btn_col1, btn_col2, _ = st.columns([1, 1, 4])
+    select_all = btn_col1.button('Select all', key=key('gen', 'select_all'))
+    clear_all = btn_col2.button('Clear', key=key('gen', 'clear_all'))
+
+    if select_all:
+        st.session_state[selected_metrics_key] = list(ratio_defs.keys())
+        for name, key_name in metric_keys.items():
+            st.session_state[f"{key('gen', 'metric')}_{key_name}"] = True
+    if clear_all:
+        st.session_state[selected_metrics_key] = []
+        for name, key_name in metric_keys.items():
+            st.session_state[f"{key('gen', 'metric')}_{key_name}"] = False
+
+    if metric_mode == 'Checklist':
+        if st.session_state.get(metric_mode_prev_key) != 'Checklist':
+            for name, key_name in metric_keys.items():
+                st.session_state[f"{key('gen', 'metric')}_{key_name}"] = (
+                    name in st.session_state[selected_metrics_key]
+                )
+        for name, key_name in metric_keys.items():
+            widget_key = f"{key('gen', 'metric')}_{key_name}"
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = name in st.session_state[selected_metrics_key]
+        check_cols = st.columns(3)
+        for idx, name in enumerate(ratio_defs.keys()):
+            widget_key = f"{key('gen', 'metric')}_{metric_keys[name]}"
+            with check_cols[idx % 3]:
+                st.checkbox(name, key=widget_key)
+        selected_metrics = [
+            name for name in ratio_defs.keys()
+            if st.session_state.get(f"{key('gen', 'metric')}_{metric_keys[name]}")
+        ]
+        st.session_state[selected_metrics_key] = selected_metrics
     else:
-        knn_left, knn_right = tab_knn.columns([1, 1], gap="large")
-        knn_date = knn_left.date_input(
-            "Date range",
-            value=(min_d, max_d),
-            min_value=min_d,
-            max_value=max_d,
-            key="knn_date_range",
+        if st.session_state.get(metric_mode_prev_key) == 'Checklist':
+            selected_metrics = [
+                name for name in ratio_defs.keys()
+                if st.session_state.get(f"{key('gen', 'metric')}_{metric_keys[name]}")
+            ]
+            st.session_state[selected_metrics_key] = selected_metrics
+        st.multiselect(
+            'Ratios to display',
+            list(ratio_defs.keys()),
+            key=selected_metrics_key,
         )
-        knn_metrics_default = metrics_pool[:5] if len(metrics_pool) >= 5 else metrics_pool
-        knn_metrics = knn_left.multiselect(
-            "Metrics for similarity",
-            options=metrics_pool,
-            default=st.session_state.get("knn_metrics", knn_metrics_default),
-            key="knn_metrics",
-        )
-        knn_mode = knn_left.selectbox(
-            "Feature level",
-            ["Aggregated", "Daily"],
-            index=0,
-            key="knn_feature_level",
-            help="Aggregated uses one vector per region. Daily uses day-level vectors.",
-        )
+        selected_metrics = st.session_state[selected_metrics_key]
 
-        focus_region = knn_right.selectbox(
-            "Focus region",
-            options=regions,
-            index=0,
-            key="knn_focus_region",
-        )
-        candidate_regions = knn_right.multiselect(
-            "Candidate regions",
-            options=regions,
-            default=regions,
-            key="knn_candidate_regions",
-        )
-        max_k = max(len(candidate_regions) - 1, 1)
-        k_neighbors = knn_right.slider(
-            "K neighbors",
-            min_value=1,
-            max_value=max_k,
-            value=min(5, max_k),
-            key="knn_k",
-        )
-        run_knn = knn_right.button("Run KNN", use_container_width=True, key="knn_run")
+    st.session_state[metric_mode_prev_key] = metric_mode
 
-        if not knn_metrics:
-            tab_knn.info("Select at least one metric to run KNN.")
-        elif not run_knn:
-            tab_knn.info("Click Run KNN to compute the closest regions.")
+    with st.expander('Add custom ratio'):
+        custom_name = st.text_input('Custom ratio name', value='', key=key('gen', 'custom_ratio_name'))
+        custom_num = st.selectbox('Numerator column', numeric_cols, key=key('gen', 'custom_ratio_num'))
+        custom_den = st.selectbox(
+            'Denominator column',
+            numeric_cols,
+            index=1 if len(numeric_cols) > 1 else 0,
+            key=key('gen', 'custom_ratio_den'),
+        )
+        add_custom = st.button('Add ratio', key=key('gen', 'add_ratio'))
+        if add_custom and custom_name.strip():
+            name = custom_name.strip()
+            st.session_state[custom_ratios_key][name] = (custom_num, custom_den)
+            ratio_defs[name] = (custom_num, custom_den)
+            if name not in st.session_state[selected_metrics_key]:
+                st.session_state[selected_metrics_key].append(name)
+            st.rerun()
+
+    ratios = {k: v for k, v in ratio_defs.items() if k in st.session_state[selected_metrics_key]}
+
+    raw_metrics = st.multiselect(
+        'Raw metrics (totals)',
+        numeric_cols,
+        default=[],
+        help='These are summed over the selected period and segment.',
+        key=key('gen', 'raw_metrics'),
+    )
+    if region_col != '(none)' and focus_regions:
+        region_series = working_df[region_col]
+        focus_mask = region_series.isin(focus_regions)
+        if include_unknown_region:
+            other_mask = ~focus_mask
         else:
-            knn_start = pd.to_datetime(knn_date[0])
-            knn_end = pd.to_datetime(knn_date[1])
-            source_mode = "all"
+            other_mask = (~focus_mask) & region_series.notna()
+        show_other = True
+        focus_label = f"{region_col}: {', '.join(str(v) for v in focus_regions[:3])}"
+        if len(focus_regions) > 3:
+            focus_label += ' ...'
+        other_label = 'All Other Regions'
+    else:
+        focus_mask = pd.Series(True, index=working_df.index)
+        other_mask = pd.Series(False, index=working_df.index)
+        show_other = False
+        focus_label = 'All Data'
+        other_label = 'All Other Regions'
 
-            if knn_mode == "Daily":
-                daily = fetch_region_daily_features(
-                    con,
-                    allowed_cols,
-                    source_col,
-                    date_col,
-                    knn_metrics,
-                    region_col,
-                    agg_fn,
-                    knn_start,
-                    knn_end,
-                    source_mode,
-                    candidate_regions,
-                )
-                if daily.empty:
-                    tab_knn.warning("No daily data available for the selected filters.")
-                    st.stop()
-                daily["day"] = pd.to_datetime(daily["day"])
-                daily["region"] = daily["region"].astype(str)
-                all_days = pd.date_range(knn_start, knn_end, freq="D")
-                vectors = []
-                for region in candidate_regions:
-                    region_df = daily[daily["region"] == region].set_index("day")
-                    if region_df.empty:
-                        continue
-                    region_df = region_df.reindex(all_days)
-                    region_df[knn_metrics] = region_df[knn_metrics].fillna(0)
-                    row = {"region": region}
-                    for m in knn_metrics:
-                        for day in all_days:
-                            row[f"{m}|{day.date()}"] = float(region_df.loc[day, m])
-                    vectors.append(row)
-                metrics_df = pd.DataFrame(vectors)
+    if source_col != '(none)':
+        source_series = working_df[source_col].astype('string').str.strip().str.lower()
+        try:
+            pattern = re.compile(meta_pattern, flags=re.IGNORECASE)
+        except re.error as exc:
+            st.error(f'Invalid regex pattern: {exc}')
+            st.stop()
+        meta_mask = source_series.str.contains(pattern, na=False)
+        if include_unknown_source:
+            non_meta_mask = ~meta_mask
+        else:
+            non_meta_mask = (~meta_mask) & source_series.notna()
+        source_segments = {'Meta': meta_mask, 'Non-Meta': non_meta_mask}
+        segment_note = '(Meta vs Non-Meta)'
+    else:
+        source_segments = {'All Data': pd.Series(True, index=working_df.index)}
+        segment_note = '(All Data)'
+
+    focus_segments = {label: focus_mask & mask for label, mask in source_segments.items()}
+    other_segments = {label: other_mask & mask for label, mask in source_segments.items()}
+
+    ratio_focus_table = compute_ratio_table(working_df, ratios, periods, focus_segments)
+    raw_focus_table = compute_sum_table(working_df, raw_metrics, periods, focus_segments)
+
+    ratio_other_table = compute_ratio_table(working_df, ratios, periods, other_segments)
+    raw_other_table = compute_sum_table(working_df, raw_metrics, periods, other_segments)
+
+    segment_labels = list(focus_segments.keys())
+    period_labels = list(periods.keys())
+    highlight_periods = ['Campaign', 'Post']
+
+    ratio_focus_table_display, ratio_focus_index = format_indexed_table(
+        ratio_focus_table, segment_labels, period_labels, format_ratio
+    )
+    ratio_other_table_display, ratio_other_index = format_indexed_table(
+        ratio_other_table, segment_labels, period_labels, format_ratio
+    )
+
+    raw_focus_table_display, raw_focus_index = format_indexed_table(
+        raw_focus_table, segment_labels, period_labels, format_raw
+    )
+    raw_other_table_display, raw_other_index = format_indexed_table(
+        raw_other_table, segment_labels, period_labels, format_raw
+    )
+
+    tabs = st.tabs(['Ratios', 'Raw Metrics'])
+
+    with tabs[0]:
+        st.subheader(f'{focus_label} {segment_note}')
+        if ratio_focus_table_display.empty:
+            st.info('No ratio metrics selected or no data for the selected filters.')
+        else:
+            ratio_focus_styles = build_index_styles(ratio_focus_index, highlight_periods)
+            st.dataframe(
+                ratio_focus_table_display.style.apply(lambda _: ratio_focus_styles, axis=None),
+                use_container_width=True
+            )
+
+        if show_other:
+            st.subheader(f'{other_label} {segment_note}')
+            if ratio_other_table_display.empty:
+                st.info('No ratio metrics selected or no data for the selected filters.')
             else:
-                features = fetch_region_features(
-                    con,
-                    allowed_cols,
-                    source_col,
-                    date_col,
-                    knn_metrics,
-                    region_col,
-                    agg_fn,
-                    knn_start,
-                    knn_end,
-                    source_mode,
-                    candidate_regions,
+                ratio_other_styles = build_index_styles(ratio_other_index, highlight_periods)
+                st.dataframe(
+                    ratio_other_table_display.style.apply(lambda _: ratio_other_styles, axis=None),
+                    use_container_width=True
                 )
-                if features.empty:
-                    tab_knn.warning("No data for the selected filters.")
-                    st.stop()
-                features = features.copy()
-                features["region"] = features["region"].astype(str)
-                metrics_df = features[["region"] + knn_metrics].copy()
 
-            if metrics_df.empty or focus_region not in metrics_df["region"].astype(str).tolist():
-                tab_knn.warning("No data for the selected focus region and filters.")
+    with tabs[1]:
+        st.subheader(f'{focus_label} {segment_note}')
+        if raw_focus_table_display.empty:
+            st.info('No raw metrics selected or no data for the selected filters.')
+        else:
+            raw_focus_styles = build_index_styles(raw_focus_index, highlight_periods)
+            st.dataframe(
+                raw_focus_table_display.style.apply(lambda _: raw_focus_styles, axis=None),
+                use_container_width=True
+            )
+
+        if show_other:
+            st.subheader(f'{other_label} {segment_note}')
+            if raw_other_table_display.empty:
+                st.info('No raw metrics selected or no data for the selected filters.')
             else:
-                metrics_df = metrics_df.copy()
-                for m in metrics_df.columns:
-                    if m == "region":
-                        continue
-                    metrics_df[m] = pd.to_numeric(metrics_df[m], errors="coerce")
-                metrics_df = metrics_df.dropna(how="all", subset=[c for c in metrics_df.columns if c != "region"])
+                raw_other_styles = build_index_styles(raw_other_index, highlight_periods)
+                st.dataframe(
+                    raw_other_table_display.style.apply(lambda _: raw_other_styles, axis=None),
+                    use_container_width=True
+                )
 
-                if metrics_df.empty:
-                    tab_knn.warning("No numeric data after applying the filters.")
-                else:
-                    values = metrics_df.set_index("region")
-                    means = values.mean()
-                    stds = values.std().replace(0, pd.NA)
-                    scaled = (values - means) / stds
-                    scaled = scaled.fillna(0)
+    st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment.')
+with tabs_main[1]:
+    st.subheader('Shopify + Meta Controls')
+    row1 = st.columns([2.0, 2.0, 1.0, 2.0, 2.0, 1.0])
 
-                    focus_vec = scaled.loc[focus_region]
-                    distances = (scaled - focus_vec).pow(2).sum(axis=1).pow(0.5)
-                    distances = distances.drop(index=focus_region, errors="ignore")
+    with row1[0]:
+        shopify_upload = st.file_uploader(
+            'Upload Shopify file',
+            type=['csv', 'xlsx', 'xls'],
+            key=key('sm', 'shopify_upload')
+        )
+    shopify_path = ''
 
-                    results = distances.sort_values().head(k_neighbors).reset_index()
-                    results.columns = ["Region", "Distance"]
-                    tab_knn.subheader("Closest regions")
-                    tab_knn.dataframe(results, use_container_width=True, hide_index=True)
-                    fig = px.bar(
-                        results,
-                        x="Region",
-                        y="Distance",
-                        title="Closest regions (lower is closer)",
-                        text="Distance",
-                    )
-                    fig.update_traces(textposition="outside")
-                    fig.update_layout(margin=dict(l=10, r=10, t=45, b=10))
-                    tab_knn.plotly_chart(fig, use_container_width=True)
-                    with tab_knn.expander("Raw feature values"):
-                        tab_knn.dataframe(metrics_df, use_container_width=True, hide_index=True)
+    with row1[3]:
+        meta_upload = st.file_uploader(
+            'Upload Meta file',
+            type=['csv', 'xlsx', 'xls'],
+            key=key('sm', 'meta_upload')
+        )
+    meta_path = ''
+
+    shopify_bytes = None
+    shopify_name = None
+    shopify_ext = None
+    if shopify_upload is not None:
+        shopify_bytes = shopify_upload.getvalue()
+        shopify_name = shopify_upload.name
+        shopify_ext = Path(shopify_name).suffix.lower()
+
+    meta_bytes = None
+    meta_name = None
+    meta_ext = None
+    if meta_upload is not None:
+        meta_bytes = meta_upload.getvalue()
+        meta_name = meta_upload.name
+        meta_ext = Path(meta_name).suffix.lower()
+
+    shopify_sheet = ''
+    if shopify_bytes and shopify_ext in ['.xlsx', '.xls']:
+        sheet_names = list_sheets_from_upload(shopify_bytes)
+        if sheet_names:
+            with row1[2]:
+                shopify_sheet = st.selectbox('Shopify sheet', sheet_names, key=key('sm', 'shopify_sheet'))
+        else:
+            with row1[2]:
+                shopify_sheet = st.text_input('Shopify sheet', value='', key=key('sm', 'shopify_sheet_text'))
+    else:
+        with row1[2]:
+            shopify_sheet = st.text_input('Shopify sheet', value='', key=key('sm', 'shopify_sheet_text'))
+
+    meta_sheet = ''
+    if meta_bytes and meta_ext in ['.xlsx', '.xls']:
+        sheet_names = list_sheets_from_upload(meta_bytes)
+        if sheet_names:
+            with row1[5]:
+                meta_sheet = st.selectbox('Meta sheet', sheet_names, key=key('sm', 'meta_sheet'))
+        else:
+            with row1[5]:
+                meta_sheet = st.text_input('Meta sheet', value='', key=key('sm', 'meta_sheet_text'))
+    else:
+        with row1[5]:
+            meta_sheet = st.text_input('Meta sheet', value='', key=key('sm', 'meta_sheet_text'))
+
+    if not shopify_bytes or not meta_bytes:
+        st.info('Upload both Shopify and Meta files to continue.')
+        st.stop()
+
+    try:
+        shopify_df = load_data_bytes(shopify_bytes, shopify_name, shopify_sheet.strip() or None)
+        meta_df = load_data_bytes(meta_bytes, meta_name, meta_sheet.strip() or None)
+    except Exception as exc:
+        st.error(f'Failed to load Shopify/Meta files: {exc}')
+        st.stop()
+
+    if shopify_df.empty or meta_df.empty:
+        st.error('Shopify or Meta dataset is empty.')
+        st.stop()
+
+    shopify_date_candidates = find_date_candidates(shopify_df)
+    meta_date_candidates = find_date_candidates(meta_df)
+
+    if not shopify_date_candidates or not meta_date_candidates:
+        st.error('Date column not found in Shopify or Meta dataset.')
+        st.stop()
+
+    with st.expander('Shopify + Meta settings', expanded=True):
+        shopify_date_col = st.selectbox(
+            'Shopify date column',
+            shopify_date_candidates,
+            index=0,
+            key=key('sm', 'shopify_date_col')
+        )
+        meta_date_col = st.selectbox(
+            'Meta date column',
+            meta_date_candidates,
+            index=0,
+            key=key('sm', 'meta_date_col')
+        )
+
+        shopify_non_numeric = [
+            c for c in shopify_df.columns
+            if c != shopify_date_col and not pd.api.types.is_numeric_dtype(shopify_df[c])
+        ]
+        default_cat = None
+        for c in shopify_non_numeric:
+            if 'new' in c.lower() and 'return' in c.lower():
+                default_cat = c
+                break
+        if not default_cat and shopify_non_numeric:
+            default_cat = shopify_non_numeric[0]
+
+        cat_col = st.selectbox(
+            'Shopify category column',
+            shopify_non_numeric,
+            index=shopify_non_numeric.index(default_cat) if default_cat in shopify_non_numeric else 0,
+            key=key('sm', 'shopify_cat_col')
+        )
+
+        shopify_numeric = [
+            c for c in shopify_df.select_dtypes(include='number').columns
+            if c != shopify_date_col
+        ]
+        default_metrics = [c for c in ['Net sales', 'Orders'] if c in shopify_numeric]
+        if not default_metrics:
+            default_metrics = shopify_numeric[:2]
+        shopify_metrics = st.multiselect(
+            'Shopify metrics to pivot',
+            shopify_numeric,
+            default=default_metrics,
+            key=key('sm', 'shopify_metrics')
+        )
+
+    shopify_df['date'] = normalize_date(shopify_df[shopify_date_col])
+    meta_df['date'] = normalize_date(meta_df[meta_date_col])
+
+    shopify_df = shopify_df[shopify_df['date'].notna()].copy()
+    meta_df = meta_df[meta_df['date'].notna()].copy()
+
+    if shopify_df.empty or meta_df.empty:
+        st.error('No usable dates found in Shopify or Meta dataset.')
+        st.stop()
+
+    shop_min, shop_max = shopify_df['date'].min(), shopify_df['date'].max()
+    meta_min, meta_max = meta_df['date'].min(), meta_df['date'].max()
+
+    overlap_start = max(shop_min, meta_min)
+    overlap_end = min(shop_max, meta_max)
+    if overlap_end < overlap_start:
+        st.error('No overlapping dates between Shopify and Meta datasets.')
+        st.stop()
+
+    shopify_df = shopify_df[(shopify_df['date'] >= overlap_start) & (shopify_df['date'] <= overlap_end)]
+    meta_df = meta_df[(meta_df['date'] >= overlap_start) & (meta_df['date'] <= overlap_end)]
+
+    shopify_df[cat_col] = shopify_df[cat_col].astype('string').str.strip().str.title()
+    shopify_df = shopify_df[shopify_df[cat_col].notna()]
+
+    shopify_grouped = (
+        shopify_df.groupby(['date', cat_col], as_index=False)[shopify_metrics]
+        .sum()
+    )
+    shopify_pivot = shopify_grouped.pivot(index='date', columns=cat_col, values=shopify_metrics)
+    shopify_pivot.columns = [
+        f"shopify_{metric.lower().replace(' ', '_')}_{cat.lower()}"
+        for metric, cat in shopify_pivot.columns
+    ]
+    shopify_pivot = shopify_pivot.reset_index().fillna(0)
+
+    meta_numeric = [
+        c for c in meta_df.select_dtypes(include='number').columns
+        if c != meta_date_col
+    ]
+    meta_agg = meta_df.groupby('date', as_index=False)[meta_numeric].sum()
+    meta_agg = meta_agg.rename(columns={c: f'meta_{c}' for c in meta_agg.columns if c != 'date'})
+
+    merged = shopify_pivot.merge(meta_agg, on='date', how='inner')
+
+    if merged.empty:
+        st.error('Merged Shopify + Meta dataset is empty after pivot/merge.')
+        st.stop()
+    min_date = merged['date'].min()
+    max_date = merged['date'].max()
+
+    campaign_length = 30
+    campaign_start_default = max_date - timedelta(days=campaign_length - 1)
+    campaign_end_default = max_date
+    pre_end_default = campaign_start_default - timedelta(days=1)
+    pre_start_default = pre_end_default - timedelta(days=campaign_length - 1)
+    post_start_default = campaign_end_default + timedelta(days=1)
+    post_end_default = post_start_default + timedelta(days=campaign_length - 1)
+
+    pre_start_default, pre_end_default = clamp_range(pre_start_default, pre_end_default, min_date, max_date)
+    campaign_start_default, campaign_end_default = clamp_range(
+        campaign_start_default, campaign_end_default, min_date, max_date
+    )
+    post_start_default, post_end_default = clamp_range(post_start_default, post_end_default, min_date, max_date)
+
+    row2 = st.columns(6)
+    with row2[0]:
+        pre_start = st.date_input('Pre start', value=pre_start_default.date(), key=key('sm', 'pre_start'))
+    with row2[1]:
+        pre_end = st.date_input('Pre end', value=pre_end_default.date(), key=key('sm', 'pre_end'))
+    with row2[2]:
+        campaign_start = st.date_input(
+            'Campaign start', value=campaign_start_default.date(), key=key('sm', 'campaign_start')
+        )
+    with row2[3]:
+        campaign_end = st.date_input(
+            'Campaign end', value=campaign_end_default.date(), key=key('sm', 'campaign_end')
+        )
+    with row2[4]:
+        post_start = st.date_input('Post start', value=post_start_default.date(), key=key('sm', 'post_start'))
+    with row2[5]:
+        post_end = st.date_input('Post end', value=post_end_default.date(), key=key('sm', 'post_end'))
+
+    pre_start = pd.Timestamp(pre_start)
+    pre_end = pd.Timestamp(pre_end)
+    campaign_start = pd.Timestamp(campaign_start)
+    campaign_end = pd.Timestamp(campaign_end)
+    post_start = pd.Timestamp(post_start)
+    post_end = pd.Timestamp(post_end)
+
+    if pre_end < pre_start or campaign_end < campaign_start or post_end < post_start:
+        st.error('Each period must have an end date on or after its start date.')
+        st.stop()
+
+    st.caption(f'Overlap range: {min_date.date()} to {max_date.date()}')
+
+    periods = {
+        'Pre': (pre_start, pre_end),
+        'Campaign': (campaign_start, campaign_end),
+        'Post': (post_start, post_end),
+    }
+
+    numeric_cols = [c for c in merged.select_dtypes(include='number').columns if c != 'date']
+
+    ratio_defs = {}
+    if 'meta_Amount spent (USD)' in merged.columns and 'meta_Impressions' in merged.columns:
+        ratio_defs['Meta Spend / Impressions'] = ('meta_Amount spent (USD)', 'meta_Impressions')
+
+    custom_ratios_key = key('sm', 'custom_ratios')
+    selected_metrics_key = key('sm', 'selected_metrics')
+    metric_mode_key = key('sm', 'metric_mode')
+    metric_mode_prev_key = key('sm', 'metric_mode_prev')
+
+    if custom_ratios_key not in st.session_state:
+        st.session_state[custom_ratios_key] = {}
+
+    ratio_defs.update(st.session_state[custom_ratios_key])
+
+    if selected_metrics_key not in st.session_state:
+        st.session_state[selected_metrics_key] = list(ratio_defs.keys())
+    else:
+        st.session_state[selected_metrics_key] = [
+            m for m in st.session_state[selected_metrics_key] if m in ratio_defs
+        ]
+
+    st.subheader('Metrics')
+    metric_mode = st.radio(
+        'Metrics selection mode',
+        ['Multiselect', 'Checklist'],
+        horizontal=True,
+        key=metric_mode_key,
+    )
+
+    metric_keys = {name: metric_key(name) for name in ratio_defs}
+
+    btn_col1, btn_col2, _ = st.columns([1, 1, 4])
+    select_all = btn_col1.button('Select all', key=key('sm', 'select_all'))
+    clear_all = btn_col2.button('Clear', key=key('sm', 'clear_all'))
+
+    if select_all:
+        st.session_state[selected_metrics_key] = list(ratio_defs.keys())
+        for name, key_name in metric_keys.items():
+            st.session_state[f"{key('sm', 'metric')}_{key_name}"] = True
+    if clear_all:
+        st.session_state[selected_metrics_key] = []
+        for name, key_name in metric_keys.items():
+            st.session_state[f"{key('sm', 'metric')}_{key_name}"] = False
+
+    if metric_mode == 'Checklist':
+        if st.session_state.get(metric_mode_prev_key) != 'Checklist':
+            for name, key_name in metric_keys.items():
+                st.session_state[f"{key('sm', 'metric')}_{key_name}"] = (
+                    name in st.session_state[selected_metrics_key]
+                )
+        for name, key_name in metric_keys.items():
+            widget_key = f"{key('sm', 'metric')}_{key_name}"
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = name in st.session_state[selected_metrics_key]
+        check_cols = st.columns(3)
+        for idx, name in enumerate(ratio_defs.keys()):
+            widget_key = f"{key('sm', 'metric')}_{metric_keys[name]}"
+            with check_cols[idx % 3]:
+                st.checkbox(name, key=widget_key)
+        selected_metrics = [
+            name for name in ratio_defs.keys()
+            if st.session_state.get(f"{key('sm', 'metric')}_{metric_keys[name]}")
+        ]
+        st.session_state[selected_metrics_key] = selected_metrics
+    else:
+        if st.session_state.get(metric_mode_prev_key) == 'Checklist':
+            selected_metrics = [
+                name for name in ratio_defs.keys()
+                if st.session_state.get(f"{key('sm', 'metric')}_{metric_keys[name]}")
+            ]
+            st.session_state[selected_metrics_key] = selected_metrics
+        st.multiselect(
+            'Ratios to display',
+            list(ratio_defs.keys()),
+            key=selected_metrics_key,
+        )
+        selected_metrics = st.session_state[selected_metrics_key]
+
+    st.session_state[metric_mode_prev_key] = metric_mode
+
+    with st.expander('Add custom ratio'):
+        custom_name = st.text_input('Custom ratio name', value='', key=key('sm', 'custom_ratio_name'))
+        custom_num = st.selectbox('Numerator column', numeric_cols, key=key('sm', 'custom_ratio_num'))
+        custom_den = st.selectbox(
+            'Denominator column',
+            numeric_cols,
+            index=1 if len(numeric_cols) > 1 else 0,
+            key=key('sm', 'custom_ratio_den'),
+        )
+        add_custom = st.button('Add ratio', key=key('sm', 'add_ratio'))
+        if add_custom and custom_name.strip():
+            name = custom_name.strip()
+            st.session_state[custom_ratios_key][name] = (custom_num, custom_den)
+            ratio_defs[name] = (custom_num, custom_den)
+            if name not in st.session_state[selected_metrics_key]:
+                st.session_state[selected_metrics_key].append(name)
+            st.rerun()
+
+    ratios = {k: v for k, v in ratio_defs.items() if k in st.session_state[selected_metrics_key]}
+
+    raw_metrics = st.multiselect(
+        'Raw metrics (totals)',
+        numeric_cols,
+        default=[],
+        help='These are summed over the selected period.',
+        key=key('sm', 'raw_metrics'),
+    )
+
+    segment_labels = ['All Data']
+    segments = {'All Data': pd.Series(True, index=merged.index)}
+
+    ratio_table = compute_ratio_table(merged, ratios, periods, segments)
+    raw_table = compute_sum_table(merged, raw_metrics, periods, segments)
+
+    period_labels = list(periods.keys())
+    highlight_periods = ['Campaign', 'Post']
+
+    ratio_display, ratio_index = format_indexed_table(ratio_table, segment_labels, period_labels, format_ratio)
+    raw_display, raw_index = format_indexed_table(raw_table, segment_labels, period_labels, format_raw)
+
+    tabs = st.tabs(['Ratios', 'Raw Metrics'])
+
+    with tabs[0]:
+        if ratio_display.empty:
+            st.info('No ratio metrics selected or no data for the selected filters.')
+        else:
+            ratio_styles = build_index_styles(ratio_index, highlight_periods)
+            st.dataframe(
+                ratio_display.style.apply(lambda _: ratio_styles, axis=None),
+                use_container_width=True
+            )
+
+    with tabs[1]:
+        if raw_display.empty:
+            st.info('No raw metrics selected or no data for the selected filters.')
+        else:
+            raw_styles = build_index_styles(raw_index, highlight_periods)
+            st.dataframe(
+                raw_display.style.apply(lambda _: raw_styles, axis=None),
+                use_container_width=True
+            )
+
+    st.caption('Notes: Each cell is value (index). Index uses Pre = 100 for each segment.')
