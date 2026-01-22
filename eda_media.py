@@ -380,7 +380,7 @@ if all(v is not None for v in st.session_state.data.values()):
             # Filter by date
             filtered = df.copy()
             if date_col:
-                filtered[date_col] = pd.to_datetime(filtered[date_col])
+                filtered[date_col] = pd.to_datetime(filtered[date_col], dayfirst=True, errors='coerce')
                 filtered = filtered[(filtered[date_col] >= pd.to_datetime(start_date)) & 
                                   (filtered[date_col] <= pd.to_datetime(end_date))]
             
@@ -438,7 +438,7 @@ if all(v is not None for v in st.session_state.data.values()):
         def process_weighted_average(df, metric, weight_col, start_date, end_date, regions, date_col, region_col, split_col, pivot_col=None):
             filtered = df.copy()
             if date_col:
-                filtered[date_col] = pd.to_datetime(filtered[date_col])
+                filtered[date_col] = pd.to_datetime(filtered[date_col], dayfirst=True, errors='coerce')
                 filtered = filtered[(filtered[date_col] >= pd.to_datetime(start_date)) & 
                                   (filtered[date_col] <= pd.to_datetime(end_date))]
 
