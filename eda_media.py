@@ -375,12 +375,18 @@ if all(v is not None for v in st.session_state.data.values()):
         def get_index_value(index, metric, pivot_val=None, split_key=None):
             return index.get(metric, {}).get(pivot_val, {}).get(split_key, 0)
 
+        def parse_date_series(series, dayfirst=True):
+            try:
+                return pd.to_datetime(series, dayfirst=dayfirst, errors='coerce', format='mixed')
+            except TypeError:
+                return pd.to_datetime(series, dayfirst=dayfirst, errors='coerce')
+
         # Filter and aggregate function
         def process_data(df, metrics, start_date, end_date, regions, date_col, region_col, split_col, pivot_col=None):
             # Filter by date
             filtered = df.copy()
             if date_col:
-                filtered[date_col] = pd.to_datetime(filtered[date_col], dayfirst=True, errors='coerce')
+                filtered[date_col] = parse_date_series(filtered[date_col], dayfirst=True)
                 filtered = filtered[(filtered[date_col] >= pd.to_datetime(start_date)) & 
                                   (filtered[date_col] <= pd.to_datetime(end_date))]
             
@@ -438,7 +444,7 @@ if all(v is not None for v in st.session_state.data.values()):
         def process_weighted_average(df, metric, weight_col, start_date, end_date, regions, date_col, region_col, split_col, pivot_col=None):
             filtered = df.copy()
             if date_col:
-                filtered[date_col] = pd.to_datetime(filtered[date_col], dayfirst=True, errors='coerce')
+                filtered[date_col] = parse_date_series(filtered[date_col], dayfirst=True)
                 filtered = filtered[(filtered[date_col] >= pd.to_datetime(start_date)) & 
                                   (filtered[date_col] <= pd.to_datetime(end_date))]
 
