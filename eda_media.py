@@ -493,6 +493,17 @@ if all(v is not None for v in st.session_state.data.values()):
         
         # Process all data
         region_divisor = len(selected_regions) if len(selected_regions) > 1 else 1
+
+        def is_ratio_metric_name(metric_name):
+            text = str(metric_name).lower()
+            return any(x in text for x in ['ratio', 'duration', '/', '%', 'per', 'average'])
+
+        def apply_region_divisor(value, metric_name):
+            if value == '' or pd.isna(value):
+                return value
+            if is_ratio_metric_name(metric_name):
+                return value
+            return value / region_divisor
         results = []
         
         # Store filtered data for debug
@@ -532,17 +543,17 @@ if all(v is not None for v in st.session_state.data.values()):
                             'Meta (Campaign)': 0,
                             'Non-meta (Campaign)': 0
                         }
-                        row['Meta (Campaign)'] = get_index_value(meta_camp_index, metric, piv_val, 'meta') / region_divisor
-                        row['Non-meta (Campaign)'] = get_index_value(meta_camp_index, metric, piv_val, 'non-meta') / region_divisor
-                        row['Meta (Pre-Campaign)'] = get_index_value(meta_pre_index, metric, piv_val, 'meta') / region_divisor
-                        row['Non-meta (Pre-Campaign)'] = get_index_value(meta_pre_index, metric, piv_val, 'non-meta') / region_divisor
+                        row['Meta (Campaign)'] = apply_region_divisor(get_index_value(meta_camp_index, metric, piv_val, 'meta'), metric)
+                        row['Non-meta (Campaign)'] = apply_region_divisor(get_index_value(meta_camp_index, metric, piv_val, 'non-meta'), metric)
+                        row['Meta (Pre-Campaign)'] = apply_region_divisor(get_index_value(meta_pre_index, metric, piv_val, 'meta'), metric)
+                        row['Non-meta (Pre-Campaign)'] = apply_region_divisor(get_index_value(meta_pre_index, metric, piv_val, 'non-meta'), metric)
                     else:
                         row = {
                             'Data source': 'Meta',
                             'Metric': f"{piv_val}_{metric}",
-                            'Meta (Pre-Campaign)': get_index_value(meta_pre_index, metric, piv_val, None) / region_divisor,
+                            'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(meta_pre_index, metric, piv_val, None), metric),
                             'Non-meta (Pre-Campaign)': '',
-                            'Meta (Campaign)': get_index_value(meta_camp_index, metric, piv_val, None) / region_divisor,
+                            'Meta (Campaign)': apply_region_divisor(get_index_value(meta_camp_index, metric, piv_val, None), metric),
                             'Non-meta (Campaign)': ''
                         }
                     results.append(row)
@@ -550,18 +561,18 @@ if all(v is not None for v in st.session_state.data.values()):
                 row = {
                     'Data source': 'Meta',
                     'Metric': metric,
-                    'Meta (Pre-Campaign)': get_index_value(meta_pre_index, metric, None, 'meta') / region_divisor,
-                    'Non-meta (Pre-Campaign)': get_index_value(meta_pre_index, metric, None, 'non-meta') / region_divisor,
-                    'Meta (Campaign)': get_index_value(meta_camp_index, metric, None, 'meta') / region_divisor,
-                    'Non-meta (Campaign)': get_index_value(meta_camp_index, metric, None, 'non-meta') / region_divisor
+                    'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(meta_pre_index, metric, None, 'meta'), metric),
+                    'Non-meta (Pre-Campaign)': apply_region_divisor(get_index_value(meta_pre_index, metric, None, 'non-meta'), metric),
+                    'Meta (Campaign)': apply_region_divisor(get_index_value(meta_camp_index, metric, None, 'meta'), metric),
+                    'Non-meta (Campaign)': apply_region_divisor(get_index_value(meta_camp_index, metric, None, 'non-meta'), metric)
                 }
             else:
                 row = {
                     'Data source': 'Meta',
                     'Metric': metric,
-                    'Meta (Pre-Campaign)': get_index_value(meta_pre_index, metric, None, None) / region_divisor,
+                    'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(meta_pre_index, metric, None, None), metric),
                     'Non-meta (Pre-Campaign)': '',
-                    'Meta (Campaign)': get_index_value(meta_camp_index, metric, None, None) / region_divisor,
+                    'Meta (Campaign)': apply_region_divisor(get_index_value(meta_camp_index, metric, None, None), metric),
                     'Non-meta (Campaign)': ''
                 }
             results.append(row)
@@ -593,17 +604,17 @@ if all(v is not None for v in st.session_state.data.values()):
                             'Meta (Campaign)': 0,
                             'Non-meta (Campaign)': 0
                         }
-                        row['Meta (Campaign)'] = get_index_value(shopify_camp_index, metric, piv_val, 'meta') / region_divisor
-                        row['Non-meta (Campaign)'] = get_index_value(shopify_camp_index, metric, piv_val, 'non-meta') / region_divisor
-                        row['Meta (Pre-Campaign)'] = get_index_value(shopify_pre_index, metric, piv_val, 'meta') / region_divisor
-                        row['Non-meta (Pre-Campaign)'] = get_index_value(shopify_pre_index, metric, piv_val, 'non-meta') / region_divisor
+                        row['Meta (Campaign)'] = apply_region_divisor(get_index_value(shopify_camp_index, metric, piv_val, 'meta'), metric)
+                        row['Non-meta (Campaign)'] = apply_region_divisor(get_index_value(shopify_camp_index, metric, piv_val, 'non-meta'), metric)
+                        row['Meta (Pre-Campaign)'] = apply_region_divisor(get_index_value(shopify_pre_index, metric, piv_val, 'meta'), metric)
+                        row['Non-meta (Pre-Campaign)'] = apply_region_divisor(get_index_value(shopify_pre_index, metric, piv_val, 'non-meta'), metric)
                     else:
                         row = {
                             'Data source': 'Shopify',
                             'Metric': f"{piv_val}_{metric}",
-                            'Meta (Pre-Campaign)': get_index_value(shopify_pre_index, metric, piv_val, None) / region_divisor,
+                            'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(shopify_pre_index, metric, piv_val, None), metric),
                             'Non-meta (Pre-Campaign)': '',
-                            'Meta (Campaign)': get_index_value(shopify_camp_index, metric, piv_val, None) / region_divisor,
+                            'Meta (Campaign)': apply_region_divisor(get_index_value(shopify_camp_index, metric, piv_val, None), metric),
                             'Non-meta (Campaign)': ''
                         }
                     
@@ -612,18 +623,18 @@ if all(v is not None for v in st.session_state.data.values()):
                 row = {
                     'Data source': 'Shopify',
                     'Metric': metric,
-                    'Meta (Pre-Campaign)': get_index_value(shopify_pre_index, metric, None, 'meta') / region_divisor,
-                    'Non-meta (Pre-Campaign)': get_index_value(shopify_pre_index, metric, None, 'non-meta') / region_divisor,
-                    'Meta (Campaign)': get_index_value(shopify_camp_index, metric, None, 'meta') / region_divisor,
-                    'Non-meta (Campaign)': get_index_value(shopify_camp_index, metric, None, 'non-meta') / region_divisor
+                    'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(shopify_pre_index, metric, None, 'meta'), metric),
+                    'Non-meta (Pre-Campaign)': apply_region_divisor(get_index_value(shopify_pre_index, metric, None, 'non-meta'), metric),
+                    'Meta (Campaign)': apply_region_divisor(get_index_value(shopify_camp_index, metric, None, 'meta'), metric),
+                    'Non-meta (Campaign)': apply_region_divisor(get_index_value(shopify_camp_index, metric, None, 'non-meta'), metric)
                 }
             else:
                 row = {
                     'Data source': 'Shopify',
                     'Metric': metric,
-                    'Meta (Pre-Campaign)': get_index_value(shopify_pre_index, metric, None, None) / region_divisor,
+                    'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(shopify_pre_index, metric, None, None), metric),
                     'Non-meta (Pre-Campaign)': '',
-                    'Meta (Campaign)': get_index_value(shopify_camp_index, metric, None, None) / region_divisor,
+                    'Meta (Campaign)': apply_region_divisor(get_index_value(shopify_camp_index, metric, None, None), metric),
                     'Non-meta (Campaign)': ''
                 }
             results.append(row)
@@ -705,17 +716,17 @@ if all(v is not None for v in st.session_state.data.values()):
                             'Meta (Campaign)': 0,
                             'Non-meta (Campaign)': 0
                         }
-                        row['Meta (Campaign)'] = get_index_value(ga_camp_index, metric, piv_val, 'meta') / region_divisor
-                        row['Non-meta (Campaign)'] = get_index_value(ga_camp_index, metric, piv_val, 'non-meta') / region_divisor
-                        row['Meta (Pre-Campaign)'] = get_index_value(ga_pre_index, metric, piv_val, 'meta') / region_divisor
-                        row['Non-meta (Pre-Campaign)'] = get_index_value(ga_pre_index, metric, piv_val, 'non-meta') / region_divisor
+                        row['Meta (Campaign)'] = apply_region_divisor(get_index_value(ga_camp_index, metric, piv_val, 'meta'), metric)
+                        row['Non-meta (Campaign)'] = apply_region_divisor(get_index_value(ga_camp_index, metric, piv_val, 'non-meta'), metric)
+                        row['Meta (Pre-Campaign)'] = apply_region_divisor(get_index_value(ga_pre_index, metric, piv_val, 'meta'), metric)
+                        row['Non-meta (Pre-Campaign)'] = apply_region_divisor(get_index_value(ga_pre_index, metric, piv_val, 'non-meta'), metric)
                     else:
                         row = {
                             'Data source': 'GA',
                             'Metric': f"{piv_val}_{metric}",
-                            'Meta (Pre-Campaign)': get_index_value(ga_pre_index, metric, piv_val, None) / region_divisor,
+                            'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(ga_pre_index, metric, piv_val, None), metric),
                             'Non-meta (Pre-Campaign)': '',
-                            'Meta (Campaign)': get_index_value(ga_camp_index, metric, piv_val, None) / region_divisor,
+                            'Meta (Campaign)': apply_region_divisor(get_index_value(ga_camp_index, metric, piv_val, None), metric),
                             'Non-meta (Campaign)': ''
                         }
                     results.append(row)
@@ -723,18 +734,18 @@ if all(v is not None for v in st.session_state.data.values()):
                 row = {
                     'Data source': 'GA',
                     'Metric': metric,
-                    'Meta (Pre-Campaign)': get_index_value(ga_pre_index, metric, None, 'meta') / region_divisor,
-                    'Non-meta (Pre-Campaign)': get_index_value(ga_pre_index, metric, None, 'non-meta') / region_divisor,
-                    'Meta (Campaign)': get_index_value(ga_camp_index, metric, None, 'meta') / region_divisor,
-                    'Non-meta (Campaign)': get_index_value(ga_camp_index, metric, None, 'non-meta') / region_divisor
+                    'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(ga_pre_index, metric, None, 'meta'), metric),
+                    'Non-meta (Pre-Campaign)': apply_region_divisor(get_index_value(ga_pre_index, metric, None, 'non-meta'), metric),
+                    'Meta (Campaign)': apply_region_divisor(get_index_value(ga_camp_index, metric, None, 'meta'), metric),
+                    'Non-meta (Campaign)': apply_region_divisor(get_index_value(ga_camp_index, metric, None, 'non-meta'), metric)
                 }
             else:
                 row = {
                     'Data source': 'GA',
                     'Metric': metric,
-                    'Meta (Pre-Campaign)': get_index_value(ga_pre_index, metric, None, None) / region_divisor,
+                    'Meta (Pre-Campaign)': apply_region_divisor(get_index_value(ga_pre_index, metric, None, None), metric),
                     'Non-meta (Pre-Campaign)': '',
-                    'Meta (Campaign)': get_index_value(ga_camp_index, metric, None, None) / region_divisor,
+                    'Meta (Campaign)': apply_region_divisor(get_index_value(ga_camp_index, metric, None, None), metric),
                     'Non-meta (Campaign)': ''
                 }
             results.append(row)
