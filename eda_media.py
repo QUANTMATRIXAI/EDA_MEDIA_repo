@@ -166,7 +166,7 @@ if all(v is not None for v in st.session_state.data.values()):
         st.subheader("GA Metrics")
         ga_available = get_metric_columns(st.session_state.data['ga'], ga_exclude)
         
-        # Set default base metrics - the 3 main ones
+        # Set default base metrics
         ga_default_base = []
         for possible_names in [['Sessions', 'sessions', 'Total Sessions'], 
                                ['Total users', 'Total Users', 'total_users'],
@@ -181,6 +181,19 @@ if all(v is not None for v in st.session_state.data.values()):
             ga_default_base = ga_available[:3] if len(ga_available) >= 3 else ga_available
         
         ga_metrics = st.multiselect("GA Base Metrics", ga_available, default=ga_default_base)
+
+        # Preferred GA output order (metrics + ratios)
+        ga_preferred_order = [
+            'Sessions',
+            'Total users',
+            'New users/Total users',
+            'Engaged sessions/Sessions',
+            'Items viewed/Total users',
+            'Average session duration',
+            'Add to carts/Sessions',
+            'Total purchasers',
+            'Total purchasers/Total users'
+        ]
         
         # Initialize default ratios if not exists
         if 'ga_custom_ratios' not in st.session_state:
@@ -214,17 +227,19 @@ if all(v is not None for v in st.session_state.data.values()):
                 elif col == 'Average session duration':
                     avg_session_duration = col
             
-            # Create the exact default ratios
-            if engaged_sessions and sessions_col:
-                st.session_state.ga_custom_ratios.append(f"{engaged_sessions}/{sessions_col}")
-            if new_users and users_col:
-                st.session_state.ga_custom_ratios.append(f"{new_users}/{users_col}")
-            if items_viewed and users_col:
-                st.session_state.ga_custom_ratios.append(f"{items_viewed}/{users_col}")
-            if add_to_carts and sessions_col:
-                st.session_state.ga_custom_ratios.append(f"{add_to_carts}/{sessions_col}")
-            if purchasers_col and users_col:
-                st.session_state.ga_custom_ratios.append(f"{purchasers_col}/{users_col}")
+            # Create the exact default ratios (keep preferred order)
+            ratio_map = {
+                'Engaged sessions/Sessions': (engaged_sessions, sessions_col),
+                'New users/Total users': (new_users, users_col),
+                'Items viewed/Total users': (items_viewed, users_col),
+                'Add to carts/Sessions': (add_to_carts, sessions_col),
+                'Total purchasers/Total users': (purchasers_col, users_col),
+            }
+            for ratio_name in ga_preferred_order:
+                if ratio_name in ratio_map:
+                    num_col, den_col = ratio_map[ratio_name]
+                    if num_col and den_col:
+                        st.session_state.ga_custom_ratios.append(f"{num_col}/{den_col}")
     
     # GA Ratio Builder
     with st.expander("➗ Manage GA Ratios"):
@@ -260,17 +275,19 @@ if all(v is not None for v in st.session_state.data.values()):
                 elif col == 'Add to carts':
                     add_to_carts = col
             
-            # Create the exact default ratios
-            if engaged_sessions and sessions_col:
-                st.session_state.ga_custom_ratios.append(f"{engaged_sessions}/{sessions_col}")
-            if new_users and users_col:
-                st.session_state.ga_custom_ratios.append(f"{new_users}/{users_col}")
-            if items_viewed and users_col:
-                st.session_state.ga_custom_ratios.append(f"{items_viewed}/{users_col}")
-            if add_to_carts and sessions_col:
-                st.session_state.ga_custom_ratios.append(f"{add_to_carts}/{sessions_col}")
-            if purchasers_col and users_col:
-                st.session_state.ga_custom_ratios.append(f"{purchasers_col}/{users_col}")
+            # Create the exact default ratios (keep preferred order)
+            ratio_map = {
+                'Engaged sessions/Sessions': (engaged_sessions, sessions_col),
+                'New users/Total users': (new_users, users_col),
+                'Items viewed/Total users': (items_viewed, users_col),
+                'Add to carts/Sessions': (add_to_carts, sessions_col),
+                'Total purchasers/Total users': (purchasers_col, users_col),
+            }
+            for ratio_name in ga_preferred_order:
+                if ratio_name in ratio_map:
+                    num_col, den_col = ratio_map[ratio_name]
+                    if num_col and den_col:
+                        st.session_state.ga_custom_ratios.append(f"{num_col}/{den_col}")
             
             st.success(f"Reset to {len(st.session_state.ga_custom_ratios)} default ratios!")
             st.rerun()
@@ -312,8 +329,12 @@ if all(v is not None for v in st.session_state.data.values()):
                     else:
                         st.warning("Ratio already exists")
         
-        # Add ratios to ga_metrics
-        ga_metrics = list(ga_metrics) + st.session_state.ga_custom_ratios
+        # Add ratios to ga_metrics and order by preferred list
+        ga_selected = list(ga_metrics) + st.session_state.ga_custom_ratios
+        ga_selected_set = list(dict.fromkeys(ga_selected))
+        ordered = [m for m in ga_preferred_order if m in ga_selected_set]
+        ordered += [m for m in ga_selected_set if m not in ordered]
+        ga_metrics = ordered
     
     # Pivot options
     st.header("4. Pivot Options")
